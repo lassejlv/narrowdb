@@ -57,20 +57,15 @@ SELECT * FROM logs;
 
 ## Benchmarks
 
-1M rows, Apple Silicon, release build:
+10M rows, 9 columns, Apple Silicon, release build (`cargo run --release --bin bench-narrow -- 10000000`):
 
-| Metric | Result |
-|--------|--------|
-| Ingest throughput | ~8.5M rows/sec |
-| Bytes per row | 56 |
-| Filtered GROUP BY | ~2.6ms |
-| Filtered AVG | ~0.9ms |
-| Filtered COUNT | ~0.8ms |
-| Reopen from disk | ~0.7ms |
-
-```bash
-narrowdb bench my.db 1000000
-```
+| Metric | NarrowDB | DuckDB | Delta |
+|--------|----------|--------|-------|
+| Ingest throughput | 7.2M rows/s | 1.4M rows/s | **5x faster** |
+| Storage size | 59.6 MiB (6.3 B/row) | 90.3 MiB (9.5 B/row) | **34% smaller** |
+| Filter + GROUP BY | 3.3ms | 5.9ms | **1.8x faster** |
+| Filter + GROUP BY + AVG | 4.1ms | 5.1ms | **1.2x faster** |
+| Filter + COUNT | 3.7ms | 6.5ms | **1.8x faster** |
 
 ## License
 

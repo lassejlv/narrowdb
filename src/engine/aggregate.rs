@@ -22,7 +22,9 @@ pub(super) enum AggState {
 impl AggState {
     pub(super) fn new(projection: &CompiledProjection) -> Self {
         match projection.expr {
-            CompiledProjectionExpr::Column { .. } => Self::Passthrough,
+            CompiledProjectionExpr::Column { .. } | CompiledProjectionExpr::Scalar(_) => {
+                Self::Passthrough
+            }
             CompiledProjectionExpr::Aggregate { kind, .. } => match kind {
                 AggregateKind::Count => Self::Count(0),
                 AggregateKind::Sum => Self::Sum(0.0),
@@ -40,7 +42,8 @@ impl AggState {
         row: usize,
     ) -> Result<()> {
         match (self, &projection.expr) {
-            (Self::Passthrough, CompiledProjectionExpr::Column { .. }) => Ok(()),
+            (Self::Passthrough, CompiledProjectionExpr::Column { .. })
+            | (Self::Passthrough, CompiledProjectionExpr::Scalar(_)) => Ok(()),
             (
                 Self::Count(count),
                 CompiledProjectionExpr::Aggregate {

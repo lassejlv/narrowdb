@@ -54,6 +54,7 @@ pub enum AggregateKind {
 #[derive(Debug, Clone)]
 pub enum ProjectionExpr {
     Column(String),
+    Scalar(ScalarExpr),
     Aggregate {
         kind: AggregateKind,
         column: Option<String>,
@@ -94,6 +95,7 @@ pub enum ArithmeticOp {
 #[derive(Debug, Clone)]
 pub enum ScalarExpr {
     Literal(Value),
+    ColumnRef(String),
     BinaryOp {
         left: Box<ScalarExpr>,
         op: ArithmeticOp,
@@ -336,7 +338,14 @@ fn parse_projection_expr(
                 alias,
             })
         }
-        other => bail!("unsupported projection expression: {other}"),
+        other => {
+            let alias = alias_override.unwrap_or_else(|| other.to_string());
+            let scalar = parse_scalar_expr(other)?;
+            Ok(Projection {
+                expr: ProjectionExpr::Scalar(scalar),
+                alias,
+            })
+        }
     }
 }
 
@@ -457,6 +466,10 @@ fn parse_eval(select: Select) -> Result<Command> {
 
 fn parse_scalar_expr(expr: Expr) -> Result<ScalarExpr> {
     match expr {
+        Expr::Identifier(ident) => Ok(ScalarExpr::ColumnRef(ident.value)),
+        Expr::CompoundIdentifier(parts) => {
+            Ok(ScalarExpr::ColumnRef(compound_identifier_to_string(&parts)?))
+        }
         Expr::Value(value) => Ok(ScalarExpr::Literal(parse_sql_value(value)?)),
         Expr::BinaryOp { left, op, right } => {
             let arith_op = match op {

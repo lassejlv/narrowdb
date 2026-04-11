@@ -63,6 +63,10 @@ impl NullBitmap {
         self.len == 0
     }
 
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+
     pub fn is_null(&self, index: usize) -> bool {
         !self.is_present(index)
     }

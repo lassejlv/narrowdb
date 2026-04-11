@@ -12,6 +12,18 @@ categories = ["database-implementations"]
 name = "narrowdb"
 path = "src/main.rs"
 
+[[bin]]
+name = "bench-narrow"
+path = "bench/narrow.rs"
+
+[[bin]]
+name = "bench-duckdb"
+path = "bench/duckdb.rs"
+required-features = ["bench-duckdb"]
+
+[features]
+bench-duckdb = ["dep:duckdb"]
+
 [workspace]
 members = ["crates/server"]
 resolver = "2"
@@ -25,3 +37,4 @@ ordered-float = "4.6"
 rayon = "1.10"
 rustc-hash = "2.1"
 sqlparser = "0.53"
+duckdb = { version = "1", optional = true, features = ["bundled"] }

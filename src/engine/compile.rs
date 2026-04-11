@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use ordered_float::OrderedFloat;
 
-use crate::sql::{AggregateKind, CompareOp, Filter, Projection, ProjectionExpr};
+use crate::sql::{AggregateKind, ArithmeticOp, CompareOp, Filter, Projection, ProjectionExpr, ScalarExpr};
 use crate::storage::ColumnData;
 use crate::types::{Schema, Value};
 
@@ -12,44 +12,22 @@ pub(super) struct CompiledFilter {
     pub(super) value: Value,
 }
 
-#[derive(Debug)]
-pub(super) enum RowSelection {
-    All(usize),
-    Indexes(Vec<u32>),
-}
-
-impl RowSelection {
-    pub(super) fn is_empty(&self) -> bool {
-        match self {
-            Self::All(rows) => *rows == 0,
-            Self::Indexes(rows) => rows.is_empty(),
-        }
-    }
-
-    pub(super) fn try_for_each<F>(&self, mut visitor: F) -> Result<()>
-    where
-        F: FnMut(usize) -> Result<()>,
-    {
-        match self {
-            Self::All(rows) => {
-                for row in 0..*rows {
-                    visitor(row)?;
-                }
-            }
-            Self::Indexes(rows) => {
-                for row in rows {
-                    visitor(*row as usize)?;
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
 #[derive(Debug, Clone)]
 pub(super) struct CompiledProjection {
     pub(super) alias: String,
     pub(super) expr: CompiledProjectionExpr,
+}
+
+#[derive(Debug, Clone)]
+pub(super) enum CompiledScalarExpr {
+    Literal(Value),
+    ColumnRef(usize),
+    BinaryOp {
+        left: Box<CompiledScalarExpr>,
+        op: ArithmeticOp,
+        right: Box<CompiledScalarExpr>,
+    },
+    UnaryMinus(Box<CompiledScalarExpr>),
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +36,7 @@ pub(super) enum CompiledProjectionExpr {
         column_index: usize,
         group_key_index: Option<usize>,
     },
+    Scalar(CompiledScalarExpr),
     Aggregate {
         kind: AggregateKind,
         column_index: Option<usize>,
@@ -130,6 +109,9 @@ pub(super) fn compile_projections(
                         .iter()
                         .position(|group_column| group_column == name),
                 },
+                ProjectionExpr::Scalar(scalar) => {
+                    CompiledProjectionExpr::Scalar(compile_scalar_expr(schema, scalar)?)
+                }
                 ProjectionExpr::Aggregate { kind, column } => CompiledProjectionExpr::Aggregate {
                     kind: *kind,
                     column_index: column
@@ -165,12 +147,13 @@ pub(super) fn required_column_indexes(
         required[filter.column_index] = true;
     }
     for projection in projections {
-        match projection.expr {
-            CompiledProjectionExpr::Column { column_index, .. } => required[column_index] = true,
+        match &projection.expr {
+            CompiledProjectionExpr::Column { column_index, .. } => required[*column_index] = true,
+            CompiledProjectionExpr::Scalar(scalar) => collect_scalar_columns(scalar, &mut required),
             CompiledProjectionExpr::Aggregate {
                 column_index: Some(index),
                 ..
-            } => required[index] = true,
+            } => required[*index] = true,
             CompiledProjectionExpr::Aggregate {
                 column_index: None, ..
             } => {}
@@ -184,4 +167,33 @@ pub(super) fn required_column_indexes(
         .enumerate()
         .filter_map(|(index, include)| include.then_some(index))
         .collect()
+}
+
+fn compile_scalar_expr(schema: &Schema, expr: &ScalarExpr) -> Result<CompiledScalarExpr> {
+    match expr {
+        ScalarExpr::Literal(value) => Ok(CompiledScalarExpr::Literal(value.clone())),
+        ScalarExpr::ColumnRef(name) => {
+            Ok(CompiledScalarExpr::ColumnRef(column_index(schema, name)?))
+        }
+        ScalarExpr::BinaryOp { left, op, right } => Ok(CompiledScalarExpr::BinaryOp {
+            left: Box::new(compile_scalar_expr(schema, left)?),
+            op: *op,
+            right: Box::new(compile_scalar_expr(schema, right)?),
+        }),
+        ScalarExpr::UnaryMinus(inner) => Ok(CompiledScalarExpr::UnaryMinus(Box::new(
+            compile_scalar_expr(schema, inner)?,
+        ))),
+    }
+}
+
+fn collect_scalar_columns(expr: &CompiledScalarExpr, required: &mut [bool]) {
+    match expr {
+        CompiledScalarExpr::Literal(_) => {}
+        CompiledScalarExpr::ColumnRef(index) => required[*index] = true,
+        CompiledScalarExpr::BinaryOp { left, right, .. } => {
+            collect_scalar_columns(left, required);
+            collect_scalar_columns(right, required);
+        }
+        CompiledScalarExpr::UnaryMinus(inner) => collect_scalar_columns(inner, required),
+    }
 }

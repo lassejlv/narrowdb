@@ -1,4 +1,5 @@
 mod aggregate;
+mod bitmap;
 mod compile;
 mod scan;
 
@@ -20,11 +21,12 @@ use ordered_float::OrderedFloat;
 
 use aggregate::AggState;
 use compile::{
-    CompiledProjection, CompiledProjectionExpr, column_index, compile_filters, compile_projections,
-    required_column_indexes,
+    CompiledProjection, CompiledProjectionExpr, CompiledScalarExpr, column_index, compile_filters,
+    compile_projections, required_column_indexes,
 };
 use scan::{
-    aggregate_row_group_all, aggregate_row_group_grouped, collect_row_group_aggregates, scan_table,
+    aggregate_row_group_all, aggregate_row_group_grouped, collect_row_group_aggregates,
+    parallel_scan_table,
 };
 
 pub struct NarrowDb {
@@ -289,20 +291,17 @@ impl NarrowDb {
         let filters = compile_filters(&table.schema, &plan.filters)?;
         let required_columns = (0..table.schema.columns.len()).collect::<Vec<_>>();
         let mapped = self.storage.mapped_bytes();
-        let mut rows = Vec::new();
+        let col_count = table.schema.columns.len();
 
-        scan_table(
+        let mut rows = parallel_scan_table(
             table,
             mapped,
             &filters,
             &required_columns,
             |row_group, row| {
-                rows.push(
-                    (0..table.schema.columns.len())
-                        .map(|idx| row_group.column(idx).value_at(row))
-                        .collect(),
-                );
-                Ok(())
+                (0..col_count)
+                    .map(|idx| row_group.column(idx).value_at(row))
+                    .collect()
             },
         )?;
 
@@ -320,27 +319,26 @@ impl NarrowDb {
         let required_columns =
             required_column_indexes(table.schema.columns.len(), &filters, &projections, &[]);
         let mapped = self.storage.mapped_bytes();
-        let mut rows = Vec::new();
 
-        scan_table(
+        let mut rows = parallel_scan_table(
             table,
             mapped,
             &filters,
             &required_columns,
             |row_group, row| {
-                let mut output = Vec::with_capacity(projections.len());
-                for projection in &projections {
-                    match projection.expr {
+                projections
+                    .iter()
+                    .map(|proj| match &proj.expr {
                         CompiledProjectionExpr::Column { column_index, .. } => {
-                            output.push(row_group.column(column_index).value_at(row));
+                            row_group.column(*column_index).value_at(row)
                         }
-                        CompiledProjectionExpr::Aggregate { .. } => {
-                            bail!("aggregate projection requires GROUP BY pipeline")
+                        CompiledProjectionExpr::Scalar(scalar) => {
+                            eval_compiled_scalar(scalar, row_group, row)
+                                .unwrap_or(Value::Null)
                         }
-                    }
-                }
-                rows.push(output);
-                Ok(())
+                        CompiledProjectionExpr::Aggregate { .. } => unreachable!(),
+                    })
+                    .collect()
             },
         )?;
 
@@ -435,17 +433,43 @@ fn build_output_row(
 ) -> Result<Vec<Value>> {
     let mut row = Vec::with_capacity(projections.len());
     for (projection, state) in projections.iter().zip(states) {
-        match projection.expr {
+        match &projection.expr {
             CompiledProjectionExpr::Column {
                 group_key_index, ..
             } => {
                 let key_index = group_key_index.context("grouped column missing from key")?;
                 row.push(key[key_index].clone());
             }
+            CompiledProjectionExpr::Scalar(_) => {
+                bail!("scalar expressions in aggregate queries are not yet supported")
+            }
             CompiledProjectionExpr::Aggregate { .. } => row.push(state.finish()?),
         }
     }
     Ok(row)
+}
+
+fn eval_compiled_scalar(
+    expr: &CompiledScalarExpr,
+    row_group: &crate::storage::LoadedRowGroup<'_>,
+    row: usize,
+) -> Result<Value> {
+    match expr {
+        CompiledScalarExpr::Literal(value) => Ok(value.clone()),
+        CompiledScalarExpr::ColumnRef(index) => Ok(row_group.column(*index).value_at(row)),
+        CompiledScalarExpr::UnaryMinus(inner) => {
+            match eval_compiled_scalar(inner, row_group, row)? {
+                Value::Int64(v) => Ok(Value::Int64(-v)),
+                Value::Float64(v) => Ok(Value::Float64(OrderedFloat(-v.into_inner()))),
+                other => bail!("cannot negate {other:?}"),
+            }
+        }
+        CompiledScalarExpr::BinaryOp { left, op, right } => {
+            let l = eval_compiled_scalar(left, row_group, row)?;
+            let r = eval_compiled_scalar(right, row_group, row)?;
+            eval_arithmetic(l, *op, r)
+        }
+    }
 }
 
 fn apply_order_by_and_limit(
@@ -499,6 +523,7 @@ fn execute_eval(plan: EvalPlan) -> Result<QueryResult> {
 fn eval_scalar(expr: &ScalarExpr) -> Result<Value> {
     match expr {
         ScalarExpr::Literal(value) => Ok(value.clone()),
+        ScalarExpr::ColumnRef(name) => bail!("column reference '{name}' not valid without a table"),
         ScalarExpr::UnaryMinus(inner) => match eval_scalar(inner)? {
             Value::Int64(v) => Ok(Value::Int64(-v)),
             Value::Float64(v) => Ok(Value::Float64(OrderedFloat(-v.into_inner()))),
@@ -628,6 +653,51 @@ mod tests {
         assert_eq!(result.columns, vec!["host", "service", "total"]);
         assert_eq!(result.rows[0][0].to_string(), "b");
         assert_eq!(result.rows[0][1].to_string(), "api");
+
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn evaluates_scalar_expressions_in_select() -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "narrowdb-test-scalar-{}.db",
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        ));
+
+        let mut db = NarrowDb::open(&path, DbOptions::default())?;
+        db.execute_sql(
+            "CREATE TABLE products (name TEXT, price REAL, quantity INT);
+             INSERT INTO products VALUES
+                 ('widget', 10.0, 5),
+                 ('gadget', 25.0, 3),
+                 ('gizmo', 7.5, 10);",
+        )?;
+
+        // Column * literal
+        let results =
+            db.execute_sql("SELECT price * 2 AS doubled FROM products ORDER BY doubled")?;
+        let result = results.last().unwrap();
+        assert_eq!(result.rows.len(), 3);
+        assert_eq!(result.rows[0][0], Value::Float64(OrderedFloat(15.0)));
+        assert_eq!(result.rows[1][0], Value::Float64(OrderedFloat(20.0)));
+        assert_eq!(result.rows[2][0], Value::Float64(OrderedFloat(50.0)));
+
+        // Column * column
+        let results =
+            db.execute_sql("SELECT price * quantity AS total FROM products ORDER BY total")?;
+        let result = results.last().unwrap();
+        assert_eq!(result.columns, vec!["total"]);
+        assert_eq!(result.rows[0][0], Value::Float64(OrderedFloat(50.0)));
+        assert_eq!(result.rows[1][0], Value::Float64(OrderedFloat(75.0)));
+        assert_eq!(result.rows[2][0], Value::Float64(OrderedFloat(75.0)));
+
+        // Expression with filter
+        let results = db.execute_sql(
+            "SELECT name, price + 1.5 AS adjusted FROM products WHERE quantity > 4",
+        )?;
+        let result = results.last().unwrap();
+        assert_eq!(result.rows.len(), 2);
 
         std::fs::remove_file(path)?;
         Ok(())
