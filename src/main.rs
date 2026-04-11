@@ -24,7 +24,7 @@ fn exec_command(args: &[String]) -> Result<()> {
     if args.len() < 4 {
         bail!("usage: narrowdb exec <db-file> <sql>");
     }
-    let mut db = NarrowDb::open(&args[2], DbOptions::default())?;
+    let db = NarrowDb::open(&args[2], DbOptions::default())?;
     let results = db.execute_sql(&args[3])?;
     for result in results {
         if result.columns.is_empty() {

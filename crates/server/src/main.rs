@@ -1,6 +1,6 @@
 use std::fmt::Debug;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -29,13 +29,14 @@ use tokio::net::TcpListener;
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = ServerConfig::from_args(std::env::args().skip(1).collect())?;
-    let db = Arc::new(Mutex::new(NarrowDb::open(
+    let db = Arc::new(NarrowDb::open(
         &config.db_path,
         DbOptions {
             row_group_size: config.row_group_size,
             sync_on_flush: config.sync_on_flush,
+            ..DbOptions::default()
         },
-    )?));
+    )?);
 
     let factory = Arc::new(PgServerFactory::new(db, &config));
     let listener = TcpListener::bind(&config.listen_addr)
@@ -181,7 +182,7 @@ struct PgServerFactory {
 }
 
 impl PgServerFactory {
-    fn new(db: Arc<Mutex<NarrowDb>>, config: &ServerConfig) -> Self {
+    fn new(db: Arc<NarrowDb>, config: &ServerConfig) -> Self {
         let backend = Arc::new(NarrowDbBackend {
             db,
             query_parser: Arc::new(NoopQueryParser::new()),
@@ -220,7 +221,7 @@ impl PgWireServerHandlers for PgServerFactory {
 }
 
 struct NarrowDbBackend {
-    db: Arc<Mutex<NarrowDb>>,
+    db: Arc<NarrowDb>,
     query_parser: Arc<NoopQueryParser>,
     database_name: String,
     user: String,
@@ -307,8 +308,7 @@ impl NarrowDbBackend {
         }
 
         let commands = parse_statements(query)?;
-        let mut db = self.db.lock().map_err(|_| api_error("database lock poisoned"))?;
-        let results = db.execute_sql(query).map_err(api_error)?;
+        let results = self.db.execute_sql(query).map_err(api_error)?;
 
         if commands.len() != results.len() {
             return Err(api_error("command/result length mismatch"));
@@ -418,8 +418,7 @@ impl NarrowDbBackend {
             return Ok(Vec::new());
         }
 
-        let mut db = self.db.lock().map_err(|_| api_error("database lock poisoned"))?;
-        let results = db.execute_sql(query).map_err(api_error)?;
+        let results = self.db.execute_sql(query).map_err(api_error)?;
         let Some(result) = results.into_iter().last() else {
             return Ok(Vec::new());
         };
@@ -559,13 +558,14 @@ mod tests {
             password: "secret".to_string(),
         };
 
-        let db = Arc::new(Mutex::new(NarrowDb::open(
+        let db = Arc::new(NarrowDb::open(
             &config.db_path,
             DbOptions {
                 row_group_size: config.row_group_size,
                 sync_on_flush: config.sync_on_flush,
+                ..DbOptions::default()
             },
-        )?));
+        )?);
         let factory = Arc::new(PgServerFactory::new(db, &config));
         let listener = TcpListener::bind(&config.listen_addr).await?;
         let addr = listener.local_addr()?;

@@ -27,10 +27,13 @@ const CODE_ENCODING_U8: u8 = 0;
 const CODE_ENCODING_U16: u8 = 1;
 const CODE_ENCODING_U32: u8 = 2;
 
+use std::time::Duration;
+
 #[derive(Debug, Clone)]
 pub struct DbOptions {
     pub row_group_size: usize,
     pub sync_on_flush: bool,
+    pub auto_flush_interval: Option<Duration>,
 }
 
 impl Default for DbOptions {
@@ -38,6 +41,7 @@ impl Default for DbOptions {
         Self {
             row_group_size: 16_384,
             sync_on_flush: true,
+            auto_flush_interval: None,
         }
     }
 }
@@ -763,6 +767,11 @@ impl Storage {
 
     pub fn mapped_bytes(&self) -> Option<&[u8]> {
         self.mmap.as_deref()
+    }
+
+    pub fn remap(&mut self) -> Result<()> {
+        self.mmap = Some(unsafe { MmapOptions::new().map(&self.file)? });
+        Ok(())
     }
 
     pub fn append_create_table(&mut self, schema: &Schema) -> Result<()> {

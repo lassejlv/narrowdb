@@ -14,11 +14,12 @@ fn main() -> Result<()> {
         std::fs::remove_file(DB_PATH)?;
     }
 
-    let mut db = NarrowDb::open(
+    let db = NarrowDb::open(
         DB_PATH,
         DbOptions {
             row_group_size: 32_768,
             sync_on_flush: false,
+            ..DbOptions::default()
         },
     )?;
 

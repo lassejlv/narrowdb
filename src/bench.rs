@@ -41,11 +41,12 @@ pub fn run_benchmark(path: impl AsRef<Path>, rows: usize) -> Result<()> {
         std::fs::remove_file(path)?;
     }
 
-    let mut db = NarrowDb::open(
+    let db = NarrowDb::open(
         path,
         DbOptions {
             row_group_size: 32_768,
             sync_on_flush: false,
+            ..DbOptions::default()
         },
     )?;
 
@@ -131,7 +132,7 @@ pub fn run_benchmark(path: impl AsRef<Path>, rows: usize) -> Result<()> {
     ingest_elapsed += flush_started.elapsed();
     let end_to_end_elapsed = end_to_end_started.elapsed();
 
-    let file_size = std::fs::metadata(db.path())?.len();
+    let file_size = std::fs::metadata(db.path()?)?.len();
     println!(
         "Ingested {rows} rows in {:?} end-to-end",
         end_to_end_elapsed
@@ -149,19 +150,19 @@ pub fn run_benchmark(path: impl AsRef<Path>, rows: usize) -> Result<()> {
     println!("Bytes per row: {:.2}", file_size as f64 / rows as f64);
 
     run_query_benchmark(
-        &mut db,
+        &db,
         rows,
         "SELECT service, COUNT(*) AS errors FROM logs WHERE ts >= 1700500000 AND level = 'error' GROUP BY service ORDER BY errors DESC LIMIT 5;",
         "Errors by service",
     )?;
     run_query_benchmark(
-        &mut db,
+        &db,
         rows,
         "SELECT host, AVG(duration) AS avg_ms FROM logs WHERE status >= 500 GROUP BY host ORDER BY avg_ms DESC LIMIT 10;",
         "Avg duration for 5xx",
     )?;
     run_query_benchmark(
-        &mut db,
+        &db,
         rows,
         "SELECT COUNT(*) AS slow_requests FROM logs WHERE duration >= 700.0;",
         "Slow request count",
@@ -169,17 +170,17 @@ pub fn run_benchmark(path: impl AsRef<Path>, rows: usize) -> Result<()> {
 
     drop(db);
     let reopen_started = Instant::now();
-    let mut db = NarrowDb::open(path, DbOptions::default())?;
+    let db = NarrowDb::open(path, DbOptions::default())?;
     let reopen_elapsed = reopen_started.elapsed();
     println!("Reopen time: {:?}", reopen_elapsed);
     run_query_benchmark(
-        &mut db,
+        &db,
         rows,
         "SELECT service, COUNT(*) AS total FROM logs GROUP BY service ORDER BY total DESC LIMIT 5;",
         "Post-reopen cold group by",
     )?;
     run_query_benchmark(
-        &mut db,
+        &db,
         rows,
         "SELECT service, COUNT(*) AS total FROM logs GROUP BY service ORDER BY total DESC LIMIT 5;",
         "Post-reopen warm group by",
@@ -188,7 +189,7 @@ pub fn run_benchmark(path: impl AsRef<Path>, rows: usize) -> Result<()> {
     Ok(())
 }
 
-fn run_query_benchmark(db: &mut NarrowDb, rows: usize, sql: &str, label: &str) -> Result<()> {
+fn run_query_benchmark(db: &NarrowDb, rows: usize, sql: &str, label: &str) -> Result<()> {
     let started = Instant::now();
     let results = db.execute_sql(sql)?;
     let elapsed = started.elapsed();

@@ -12,6 +12,7 @@ use crate::types::{DataType, Schema, Value};
 #[derive(Debug)]
 pub enum Command {
     CreateTable(Schema),
+    CreateTableIfNotExists(Schema),
     Insert(InsertPlan),
     Select(SelectPlan),
     Eval(EvalPlan),
@@ -126,6 +127,7 @@ fn parse_statement(statement: Statement) -> Result<Command> {
 
 fn parse_create_table(statement: sqlparser::ast::CreateTable) -> Result<Command> {
     let table_name = object_name_to_string(&statement.name.0)?;
+    let if_not_exists = statement.if_not_exists;
     let mut columns = Vec::with_capacity(statement.columns.len());
     for column in statement.columns {
         columns.push(crate::types::ColumnDef {
@@ -133,10 +135,15 @@ fn parse_create_table(statement: sqlparser::ast::CreateTable) -> Result<Command>
             data_type: DataType::from_sql_name(&column.data_type.to_string())?,
         });
     }
-    Ok(Command::CreateTable(Schema {
+    let schema = Schema {
         table_name,
         columns,
-    }))
+    };
+    if if_not_exists {
+        Ok(Command::CreateTableIfNotExists(schema))
+    } else {
+        Ok(Command::CreateTable(schema))
+    }
 }
 
 fn parse_insert(statement: sqlparser::ast::Insert) -> Result<Command> {

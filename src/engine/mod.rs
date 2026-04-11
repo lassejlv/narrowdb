@@ -5,12 +5,16 @@ mod scan;
 
 use std::cmp::Ordering;
 use std::path::Path;
+use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use rustc_hash::FxHashMap;
 
 use crate::sql::{
-    ArithmeticOp, Command, EvalPlan, InsertPlan, OrderByPlan, ProjectionExpr, ScalarExpr,
+    ArithmeticOp, Command, EvalPlan, OrderByPlan, ProjectionExpr, ScalarExpr,
     SelectPlan, parse_sql,
 };
 use crate::storage::{
@@ -30,8 +34,18 @@ use scan::{
 };
 
 pub struct NarrowDb {
+    inner: Arc<RwLock<DbInner>>,
+    flush_handle: Mutex<Option<FlushHandle>>,
+}
+
+struct DbInner {
     storage: Storage,
     tables: FxHashMap<String, Table>,
+}
+
+struct FlushHandle {
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
 }
 
 #[derive(Debug, Clone)]
@@ -51,15 +65,132 @@ impl QueryResult {
 
 impl NarrowDb {
     pub fn open(path: impl AsRef<Path>, options: DbOptions) -> Result<Self> {
+        let auto_flush_interval = options.auto_flush_interval;
         let (storage, tables) = Storage::open(path, options)?;
-        Ok(Self { storage, tables })
+        let inner = Arc::new(RwLock::new(DbInner { storage, tables }));
+
+        let flush_handle = if let Some(interval) = auto_flush_interval {
+            let weak = Arc::downgrade(&inner);
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_clone = stop.clone();
+            let thread = std::thread::spawn(move || {
+                background_flush_loop(weak, interval, stop_clone);
+            });
+            Some(FlushHandle {
+                stop,
+                thread: Some(thread),
+            })
+        } else {
+            None
+        };
+
+        Ok(Self {
+            inner,
+            flush_handle: Mutex::new(flush_handle),
+        })
     }
 
-    pub fn path(&self) -> &Path {
-        self.storage.path()
+    pub fn path(&self) -> Result<std::path::PathBuf> {
+        let inner = self.inner.read().map_err(|_| anyhow!("lock poisoned"))?;
+        Ok(inner.storage.path().to_path_buf())
     }
 
-    pub fn create_table(&mut self, schema: Schema) -> Result<()> {
+    pub fn create_table(&self, schema: Schema) -> Result<()> {
+        let mut inner = self.inner.write().map_err(|_| anyhow!("lock poisoned"))?;
+        inner.create_table_inner(schema)
+    }
+
+    pub fn insert_row(&self, table_name: &str, row: Vec<Value>) -> Result<()> {
+        let mut inner = self.inner.write().map_err(|_| anyhow!("lock poisoned"))?;
+        inner.insert_row_inner(table_name, row)
+    }
+
+    pub fn insert_rows(&self, table_name: &str, rows: Vec<Vec<Value>>) -> Result<()> {
+        let mut inner = self.inner.write().map_err(|_| anyhow!("lock poisoned"))?;
+        inner.insert_rows_inner(table_name, rows)
+    }
+
+    pub fn insert_columnar_batch(
+        &self,
+        table_name: &str,
+        batch: ColumnarBatch,
+    ) -> Result<()> {
+        let mut inner = self.inner.write().map_err(|_| anyhow!("lock poisoned"))?;
+        inner.insert_columnar_batch_inner(table_name, batch)
+    }
+
+    pub fn flush_table(&self, table_name: &str) -> Result<()> {
+        let mut inner = self.inner.write().map_err(|_| anyhow!("lock poisoned"))?;
+        inner.flush_table_inner(table_name)
+    }
+
+    pub fn flush_all(&self) -> Result<()> {
+        let mut inner = self.inner.write().map_err(|_| anyhow!("lock poisoned"))?;
+        inner.flush_all_inner()
+    }
+
+    pub fn execute_one(&self, sql: &str) -> Result<QueryResult> {
+        let mut results = self.execute_sql(sql)?;
+        results.pop().context("no result from SQL statement")
+    }
+
+    pub fn execute_sql(&self, sql: &str) -> Result<Vec<QueryResult>> {
+        let commands = parse_sql(sql)?;
+        let mut inner = self.inner.write().map_err(|_| anyhow!("lock poisoned"))?;
+        inner.execute_commands(commands)
+    }
+
+    /// Execute read-only SQL (SELECT / expressions) under a shared read lock.
+    /// Multiple `query` calls can run concurrently. Pending unflushed rows
+    /// are invisible — call `flush_all` first if you need to see them.
+    pub fn query(&self, sql: &str) -> Result<Vec<QueryResult>> {
+        let commands = parse_sql(sql)?;
+        let inner = self.inner.read().map_err(|_| anyhow!("lock poisoned"))?;
+        inner.execute_read_commands(commands)
+    }
+}
+
+impl Drop for NarrowDb {
+    fn drop(&mut self) {
+        if let Ok(mut handle) = self.flush_handle.lock() {
+            if let Some(fh) = handle.take() {
+                fh.stop.store(true, AtomicOrdering::Relaxed);
+                if let Some(ref t) = fh.thread {
+                    t.thread().unpark();
+                }
+                if let Some(t) = fh.thread {
+                    let _ = t.join();
+                }
+            }
+        }
+        if let Ok(mut inner) = self.inner.write() {
+            let _ = inner.flush_all_inner();
+        }
+    }
+}
+
+fn background_flush_loop(
+    inner: std::sync::Weak<RwLock<DbInner>>,
+    interval: Duration,
+    stop: Arc<AtomicBool>,
+) {
+    while !stop.load(AtomicOrdering::Relaxed) {
+        std::thread::park_timeout(interval);
+        if stop.load(AtomicOrdering::Relaxed) {
+            break;
+        }
+        let Some(inner) = inner.upgrade() else { break };
+        let Ok(mut guard) = inner.write() else { break };
+        let _ = guard.flush_all_inner();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DbInner — all the actual logic, called under appropriate locks
+// ---------------------------------------------------------------------------
+
+impl DbInner {
+    fn create_table_inner(&mut self, schema: Schema) -> Result<()> {
         ensure!(
             !self.tables.contains_key(&schema.table_name),
             "table {} already exists",
@@ -71,7 +202,7 @@ impl NarrowDb {
         Ok(())
     }
 
-    pub fn insert_row(&mut self, table_name: &str, row: Vec<Value>) -> Result<()> {
+    fn insert_row_inner(&mut self, table_name: &str, row: Vec<Value>) -> Result<()> {
         let table = self
             .tables
             .get_mut(table_name)
@@ -89,12 +220,12 @@ impl NarrowDb {
 
         table.pending.append_row(casted)?;
         if table.pending.rows() >= self.storage.options().row_group_size {
-            self.flush_table(table_name)?;
+            self.flush_table_inner(table_name)?;
         }
         Ok(())
     }
 
-    pub fn insert_rows(&mut self, table_name: &str, rows: Vec<Vec<Value>>) -> Result<()> {
+    fn insert_rows_inner(&mut self, table_name: &str, rows: Vec<Vec<Value>>) -> Result<()> {
         let row_group_size = self.storage.options().row_group_size;
         let (schema, flushed_groups) = {
             let table = self
@@ -143,7 +274,7 @@ impl NarrowDb {
         Ok(())
     }
 
-    pub fn insert_columnar_batch(
+    fn insert_columnar_batch_inner(
         &mut self,
         table_name: &str,
         mut batch: ColumnarBatch,
@@ -195,7 +326,7 @@ impl NarrowDb {
         Ok(())
     }
 
-    pub fn flush_table(&mut self, table_name: &str) -> Result<()> {
+    fn flush_table_inner(&mut self, table_name: &str) -> Result<()> {
         let table = self
             .tables
             .get_mut(table_name)
@@ -207,6 +338,7 @@ impl NarrowDb {
         let row_group = table.pending.take_row_group();
         self.storage
             .append_row_group(table_name, &row_group, &table.schema)?;
+        self.storage.remap()?;
         table
             .row_groups
             .push(StoredRowGroup::from_row_group(row_group));
@@ -214,31 +346,38 @@ impl NarrowDb {
         Ok(())
     }
 
-    pub fn flush_all(&mut self) -> Result<()> {
+    fn flush_all_inner(&mut self) -> Result<()> {
         let table_names = self.tables.keys().cloned().collect::<Vec<_>>();
         for table_name in table_names {
-            self.flush_table(&table_name)?;
+            self.flush_table_inner(&table_name)?;
         }
         Ok(())
     }
 
-    pub fn execute_sql(&mut self, sql: &str) -> Result<Vec<QueryResult>> {
-        let commands = parse_sql(sql)?;
+    /// Execute commands that include writes (INSERT, CREATE TABLE).
+    /// Flushes before SELECTs for consistency.
+    fn execute_commands(&mut self, commands: Vec<Command>) -> Result<Vec<QueryResult>> {
         let mut results = Vec::new();
 
         for command in commands {
             match command {
                 Command::CreateTable(schema) => {
-                    self.create_table(schema)?;
+                    self.create_table_inner(schema)?;
+                    results.push(QueryResult::empty());
+                }
+                Command::CreateTableIfNotExists(schema) => {
+                    if !self.tables.contains_key(&schema.table_name) {
+                        self.create_table_inner(schema)?;
+                    }
                     results.push(QueryResult::empty());
                 }
                 Command::Insert(plan) => {
-                    self.execute_insert(plan)?;
+                    self.insert_rows_inner(&plan.table_name, plan.rows)?;
                     results.push(QueryResult::empty());
                 }
                 Command::Select(plan) => {
-                    self.flush_table(&plan.table_name)?;
-                    results.push(self.execute_select(plan)?);
+                    self.flush_table_inner(&plan.table_name)?;
+                    results.push(self.execute_select(&plan)?);
                 }
                 Command::Eval(plan) => {
                     results.push(execute_eval(plan)?);
@@ -249,11 +388,27 @@ impl NarrowDb {
         Ok(results)
     }
 
-    fn execute_insert(&mut self, plan: InsertPlan) -> Result<()> {
-        self.insert_rows(&plan.table_name, plan.rows)
+    /// Execute read-only commands (SELECT, Eval) under a read lock.
+    /// Does NOT flush pending rows — they are invisible to these queries.
+    fn execute_read_commands(&self, commands: Vec<Command>) -> Result<Vec<QueryResult>> {
+        let mut results = Vec::new();
+
+        for command in commands {
+            match command {
+                Command::Select(plan) => {
+                    results.push(self.execute_select(&plan)?);
+                }
+                Command::Eval(plan) => {
+                    results.push(execute_eval(plan)?);
+                }
+                _ => bail!("unexpected write command in read path"),
+            }
+        }
+
+        Ok(results)
     }
 
-    fn execute_select(&self, plan: SelectPlan) -> Result<QueryResult> {
+    fn execute_select(&self, plan: &SelectPlan) -> Result<QueryResult> {
         let table = self
             .tables
             .get(&plan.table_name)
@@ -262,7 +417,7 @@ impl NarrowDb {
         if plan.projections.len() == 1
             && matches!(plan.projections[0].expr, ProjectionExpr::Column(ref name) if name == "*")
         {
-            return self.select_all(table, &plan);
+            return self.select_all(table, plan);
         }
 
         let aggregate = plan
@@ -271,9 +426,9 @@ impl NarrowDb {
             .any(|projection| matches!(projection.expr, ProjectionExpr::Aggregate { .. }));
 
         if aggregate || !plan.group_by.is_empty() {
-            self.select_aggregate(table, &plan)
+            self.select_aggregate(table, plan)
         } else {
-            self.select_rows(table, &plan)
+            self.select_rows(table, plan)
         }
     }
 
@@ -333,8 +488,7 @@ impl NarrowDb {
                             row_group.column(*column_index).value_at(row)
                         }
                         CompiledProjectionExpr::Scalar(scalar) => {
-                            eval_compiled_scalar(scalar, row_group, row)
-                                .unwrap_or(Value::Null)
+                            eval_compiled_scalar(scalar, row_group, row).unwrap_or(Value::Null)
                         }
                         CompiledProjectionExpr::Aggregate { .. } => unreachable!(),
                     })
@@ -425,6 +579,10 @@ impl NarrowDb {
         Ok(QueryResult { columns, rows })
     }
 }
+
+// ---------------------------------------------------------------------------
+// Free functions
+// ---------------------------------------------------------------------------
 
 fn build_output_row(
     projections: &[CompiledProjection],
@@ -600,11 +758,12 @@ mod tests {
         ));
 
         {
-            let mut db = NarrowDb::open(
+            let db = NarrowDb::open(
                 &path,
                 DbOptions {
                     row_group_size: 2,
                     sync_on_flush: true,
+                    ..DbOptions::default()
                 },
             )?;
             db.execute_sql(
@@ -619,7 +778,7 @@ mod tests {
             db.flush_all()?;
         }
 
-        let mut db = NarrowDb::open(&path, DbOptions::default())?;
+        let db = NarrowDb::open(&path, DbOptions::default())?;
         let results = db.execute_sql(
             "SELECT service, COUNT(*) AS errors FROM logs WHERE level = 'error' GROUP BY service ORDER BY errors DESC LIMIT 2;",
         )?;
@@ -635,7 +794,7 @@ mod tests {
             SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
         ));
 
-        let mut db = NarrowDb::open(&path, DbOptions::default())?;
+        let db = NarrowDb::open(&path, DbOptions::default())?;
         db.execute_sql(
             "
             CREATE TABLE logs (service TEXT, host TEXT, duration REAL);
@@ -665,7 +824,7 @@ mod tests {
             SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
         ));
 
-        let mut db = NarrowDb::open(&path, DbOptions::default())?;
+        let db = NarrowDb::open(&path, DbOptions::default())?;
         db.execute_sql(
             "CREATE TABLE products (name TEXT, price REAL, quantity INT);
              INSERT INTO products VALUES
@@ -710,7 +869,7 @@ mod tests {
             SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
         ));
 
-        let mut db = NarrowDb::open(&path, DbOptions::default())?;
+        let db = NarrowDb::open(&path, DbOptions::default())?;
         db.execute_sql(
             "CREATE TABLE logs (ts TIMESTAMP, service TEXT, status INT, duration REAL);",
         )?;
@@ -735,6 +894,27 @@ mod tests {
         )?;
         let result = results.last().unwrap();
         assert_eq!(result.rows.len(), 2);
+
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn create_table_if_not_exists() -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "narrowdb-test-ifne-{}.db",
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        ));
+
+        let db = NarrowDb::open(&path, DbOptions::default())?;
+        db.execute_sql("CREATE TABLE logs (ts TIMESTAMP, level TEXT);")?;
+
+        // Should not error
+        db.execute_sql("CREATE TABLE IF NOT EXISTS logs (ts TIMESTAMP, level TEXT);")?;
+
+        // Should still error without IF NOT EXISTS
+        let err = db.execute_sql("CREATE TABLE logs (ts TIMESTAMP, level TEXT);");
+        assert!(err.is_err());
 
         std::fs::remove_file(path)?;
         Ok(())
