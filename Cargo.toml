@@ -8,6 +8,10 @@ repository = "https://github.com/lassejlv/narrowdb"
 keywords = ["database", "columnar", "analytics", "logs", "timeseries"]
 categories = ["database-implementations"]
 
+[[bin]]
+name = "narrowdb"
+path = "src/main.rs"
+
 [dependencies]
 anyhow = "1.0"
 memmap2 = "0.9"
