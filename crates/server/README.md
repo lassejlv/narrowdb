@@ -16,14 +16,16 @@ narrowdb-server <db-file> [options]
 
 ## Configuration
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `<db-file>` | *required* | Path to the NarrowDB database file |
-| `--listen` | `127.0.0.1:5433` | Address and port to bind |
-| `--row-group-size` | `16384` | Rows per columnar row group |
-| `--sync-on-flush` | `true` | Fsync data to disk on flush (`true`/`false`) |
-| `--user` | `narrowdb` | Username for PostgreSQL MD5 auth |
-| `--password` | `narrowdb` | Password for PostgreSQL MD5 auth |
+| Flag | Env var | Default | Description |
+|------|--------|---------|-------------|
+| `<db-file>` | `NARROWDB_PATH` | *required* | Path to the NarrowDB database file |
+| `--listen` | `NARROWDB_LISTEN` | `127.0.0.1:5433` | Address and port to bind |
+| `--row-group-size` | `NARROWDB_ROW_GROUP_SIZE` | `16384` | Rows per columnar row group |
+| `--sync-on-flush` | `NARROWDB_SYNC_ON_FLUSH` | `true` | Fsync data to disk on flush (`true`/`false`) |
+| `--user` | `NARROWDB_USER` | `narrowdb` | Username for PostgreSQL MD5 auth |
+| `--password` | `NARROWDB_PASSWORD` | `narrowdb` | Password for PostgreSQL MD5 auth |
+
+CLI flags take priority over environment variables.
 
 ### Example
 
@@ -57,11 +59,13 @@ Run with a volume for data persistence:
 docker run -v narrowdb-data:/data -p 5433:5433 narrowdb-server
 ```
 
-Override defaults with CLI flags:
+Configure with environment variables:
 
 ```bash
-docker run -v narrowdb-data:/data -p 5433:5433 narrowdb-server \
-  /data/mydb.narrowdb --listen 0.0.0.0:5433 --user admin --password s3cret
+docker run -v narrowdb-data:/data -p 5433:5433 \
+  -e NARROWDB_USER=admin \
+  -e NARROWDB_PASSWORD=s3cret \
+  narrowdb-server
 ```
 
 ## Protocol support

@@ -22,5 +22,7 @@ COPY --from=builder /build/target/release/narrowdb-server /usr/local/bin/narrowd
 
 EXPOSE 5433
 
+ENV NARROWDB_PATH=/data/narrowdb.db
+ENV NARROWDB_LISTEN=0.0.0.0:5433
+
 ENTRYPOINT ["narrowdb-server"]
-CMD ["/data/narrowdb.db", "--listen", "0.0.0.0:5433"]

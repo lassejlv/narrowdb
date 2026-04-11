@@ -70,18 +70,23 @@ struct ServerConfig {
 
 impl ServerConfig {
     fn from_args(args: Vec<String>) -> Result<Self> {
-        if args.is_empty() {
+        let db_path = if !args.is_empty() {
+            args[0].clone()
+        } else if let Ok(val) = std::env::var("NARROWDB_PATH") {
+            val
+        } else {
             bail!(
-                "usage: narrowdb-server <db-file> [--listen 127.0.0.1:5433] [--row-group-size 16384] [--sync-on-flush true|false] [--user narrowdb] [--password secret]"
+                "usage: narrowdb-server <db-file> [--listen 127.0.0.1:5433] [--row-group-size 16384] [--sync-on-flush true|false] [--user narrowdb] [--password secret]\n\nAll flags can also be set via environment variables: NARROWDB_PATH, NARROWDB_LISTEN, NARROWDB_ROW_GROUP_SIZE, NARROWDB_SYNC_ON_FLUSH, NARROWDB_USER, NARROWDB_PASSWORD"
             );
-        }
+        };
 
-        let db_path = args[0].clone();
-        let mut listen_addr = "127.0.0.1:5433".to_string();
-        let mut row_group_size = 16_384;
-        let mut sync_on_flush = true;
-        let mut user = "narrowdb".to_string();
-        let mut password = "narrowdb".to_string();
+        let mut listen_addr = env_or("NARROWDB_LISTEN", "127.0.0.1:5433");
+        let mut row_group_size: usize = env_or("NARROWDB_ROW_GROUP_SIZE", "16384")
+            .parse()
+            .context("NARROWDB_ROW_GROUP_SIZE must be an integer")?;
+        let mut sync_on_flush = parse_bool_flag(&env_or("NARROWDB_SYNC_ON_FLUSH", "true"))?;
+        let mut user = env_or("NARROWDB_USER", "narrowdb");
+        let mut password = env_or("NARROWDB_PASSWORD", "narrowdb");
         let mut index = 1;
 
         while index < args.len() {
@@ -135,6 +140,10 @@ impl ServerConfig {
             .unwrap_or("narrowdb")
             .to_string()
     }
+}
+
+fn env_or(key: &str, default: &str) -> String {
+    std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
 fn parse_bool_flag(value: &str) -> Result<bool> {
