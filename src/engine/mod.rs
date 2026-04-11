@@ -17,6 +17,7 @@ use crate::types::{ColumnarBatch, Schema, Value};
 use aggregate::AggState;
 use compile::{
     CompiledProjection, CompiledProjectionExpr, column_index, compile_filters, compile_projections,
+    required_column_indexes,
 };
 use scan::{
     aggregate_row_group_all, aggregate_row_group_grouped, collect_row_group_aggregates, scan_table,
@@ -279,17 +280,24 @@ impl NarrowDb {
             .map(|column| column.name.clone())
             .collect::<Vec<_>>();
         let filters = compile_filters(&table.schema, &plan.filters)?;
+        let required_columns = (0..table.schema.columns.len()).collect::<Vec<_>>();
         let mapped = self.storage.mapped_bytes();
         let mut rows = Vec::new();
 
-        scan_table(table, mapped, &filters, |row_group, row| {
-            rows.push(
-                (0..table.schema.columns.len())
-                    .map(|idx| row_group.columns[idx].value_at(row))
-                    .collect(),
-            );
-            Ok(())
-        })?;
+        scan_table(
+            table,
+            mapped,
+            &filters,
+            &required_columns,
+            |row_group, row| {
+                rows.push(
+                    (0..table.schema.columns.len())
+                        .map(|idx| row_group.column(idx).value_at(row))
+                        .collect(),
+                );
+                Ok(())
+            },
+        )?;
 
         apply_order_by_and_limit(&mut rows, &columns, plan.order_by.as_ref(), plan.limit)?;
         Ok(QueryResult { columns, rows })
@@ -302,24 +310,32 @@ impl NarrowDb {
             .iter()
             .map(|projection| projection.alias.clone())
             .collect::<Vec<_>>();
+        let required_columns =
+            required_column_indexes(table.schema.columns.len(), &filters, &projections, &[]);
         let mapped = self.storage.mapped_bytes();
         let mut rows = Vec::new();
 
-        scan_table(table, mapped, &filters, |row_group, row| {
-            let mut output = Vec::with_capacity(projections.len());
-            for projection in &projections {
-                match projection.expr {
-                    CompiledProjectionExpr::Column { column_index, .. } => {
-                        output.push(row_group.columns[column_index].value_at(row));
-                    }
-                    CompiledProjectionExpr::Aggregate { .. } => {
-                        bail!("aggregate projection requires GROUP BY pipeline")
+        scan_table(
+            table,
+            mapped,
+            &filters,
+            &required_columns,
+            |row_group, row| {
+                let mut output = Vec::with_capacity(projections.len());
+                for projection in &projections {
+                    match projection.expr {
+                        CompiledProjectionExpr::Column { column_index, .. } => {
+                            output.push(row_group.column(column_index).value_at(row));
+                        }
+                        CompiledProjectionExpr::Aggregate { .. } => {
+                            bail!("aggregate projection requires GROUP BY pipeline")
+                        }
                     }
                 }
-            }
-            rows.push(output);
-            Ok(())
-        })?;
+                rows.push(output);
+                Ok(())
+            },
+        )?;
 
         apply_order_by_and_limit(&mut rows, &columns, plan.order_by.as_ref(), plan.limit)?;
         Ok(QueryResult { columns, rows })
@@ -337,12 +353,22 @@ impl NarrowDb {
             .iter()
             .map(|name| column_index(&table.schema, name))
             .collect::<Result<Vec<_>>>()?;
+        let required_columns = required_column_indexes(
+            table.schema.columns.len(),
+            &filters,
+            &projections,
+            &group_indexes,
+        );
         let mapped = self.storage.mapped_bytes();
 
         let mut rows = if group_indexes.is_empty() {
-            let partials = collect_row_group_aggregates(table, mapped, |row_group| {
-                aggregate_row_group_all(row_group, &filters, &projections)
-            })?;
+            let partials = collect_row_group_aggregates(
+                table,
+                mapped,
+                &filters,
+                &required_columns,
+                |row_group| aggregate_row_group_all(row_group, &filters, &projections),
+            )?;
             let mut states = projections.iter().map(AggState::new).collect::<Vec<_>>();
             let mut saw_row = false;
 
@@ -362,9 +388,15 @@ impl NarrowDb {
 
             vec![build_output_row(&projections, &[], states)?]
         } else {
-            let partials = collect_row_group_aggregates(table, mapped, |row_group| {
-                aggregate_row_group_grouped(row_group, &filters, &projections, &group_indexes)
-            })?;
+            let partials = collect_row_group_aggregates(
+                table,
+                mapped,
+                &filters,
+                &required_columns,
+                |row_group| {
+                    aggregate_row_group_grouped(row_group, &filters, &projections, &group_indexes)
+                },
+            )?;
             let mut global_groups: FxHashMap<Vec<Value>, Vec<AggState>> = FxHashMap::default();
 
             for partial in partials {

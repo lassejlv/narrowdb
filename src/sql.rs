@@ -185,7 +185,11 @@ fn parse_select(
 
 fn parse_filters(expr: Expr) -> Result<Vec<Filter>> {
     match expr {
-        Expr::BinaryOp { left, op: BinaryOperator::And, right } => {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
             let mut filters = parse_filters(*left)?;
             filters.extend(parse_filters(*right)?);
             Ok(filters)
@@ -202,15 +206,27 @@ fn parse_filters(expr: Expr) -> Result<Vec<Filter>> {
                 BinaryOperator::GtEq => CompareOp::Gte,
                 other => bail!("unsupported filter operator: {other}"),
             };
-            Ok(vec![Filter { column, op, value: Some(value) }])
+            Ok(vec![Filter {
+                column,
+                op,
+                value: Some(value),
+            }])
         }
         Expr::IsNull(expr) => {
             let column = parse_identifier_expr(*expr)?;
-            Ok(vec![Filter { column, op: CompareOp::IsNull, value: None }])
+            Ok(vec![Filter {
+                column,
+                op: CompareOp::IsNull,
+                value: None,
+            }])
         }
         Expr::IsNotNull(expr) => {
             let column = parse_identifier_expr(*expr)?;
-            Ok(vec![Filter { column, op: CompareOp::IsNotNull, value: None }])
+            Ok(vec![Filter {
+                column,
+                op: CompareOp::IsNotNull,
+                value: None,
+            }])
         }
         other => bail!("unsupported WHERE expression: {other}"),
     }

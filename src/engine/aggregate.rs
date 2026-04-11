@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail, ensure};
 use ordered_float::OrderedFloat;
 
 use crate::sql::AggregateKind;
-use crate::storage::RowGroup;
+use crate::storage::LoadedRowGroup;
 use crate::types::Value;
 
 use super::compile::{CompiledProjection, CompiledProjectionExpr};
@@ -36,7 +36,7 @@ impl AggState {
     pub(super) fn update(
         &mut self,
         projection: &CompiledProjection,
-        row_group: &RowGroup,
+        row_group: &LoadedRowGroup<'_>,
         row: usize,
     ) -> Result<()> {
         match (self, &projection.expr) {
@@ -58,7 +58,8 @@ impl AggState {
                     column_index: Some(index),
                 },
             ) => {
-                *sum += row_group.columns[*index]
+                *sum += row_group
+                    .column(*index)
                     .numeric_at(row)
                     .context("SUM expects a numeric column")?;
                 Ok(())
@@ -70,7 +71,7 @@ impl AggState {
                     column_index: Some(index),
                 },
             ) => {
-                let value = row_group.columns[*index].value_at(row);
+                let value = row_group.column(*index).value_at(row);
                 if current
                     .as_ref()
                     .is_none_or(|existing| value.compare(existing) == Some(Ordering::Less))
@@ -86,7 +87,7 @@ impl AggState {
                     column_index: Some(index),
                 },
             ) => {
-                let value = row_group.columns[*index].value_at(row);
+                let value = row_group.column(*index).value_at(row);
                 if current
                     .as_ref()
                     .is_none_or(|existing| value.compare(existing) == Some(Ordering::Greater))
@@ -102,7 +103,8 @@ impl AggState {
                     column_index: Some(index),
                 },
             ) => {
-                *sum += row_group.columns[*index]
+                *sum += row_group
+                    .column(*index)
                     .numeric_at(row)
                     .context("AVG expects a numeric column")?;
                 *count += 1;

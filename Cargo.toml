@@ -12,8 +12,13 @@ categories = ["database-implementations"]
 name = "narrowdb"
 path = "src/main.rs"
 
+[workspace]
+members = ["crates/server"]
+resolver = "2"
+
 [dependencies]
 anyhow = "1.0"
+lz4_flex = "0.11"
 memmap2 = "0.9"
 once_cell = "1.21"
 ordered-float = "4.6"

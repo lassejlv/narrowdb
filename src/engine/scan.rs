@@ -5,13 +5,11 @@ use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
 use crate::sql::CompareOp;
-use crate::storage::{ColumnData, ColumnStats, NullBitmap, RowGroup, Table};
+use crate::storage::{ColumnData, ColumnStats, LoadedRowGroup, NullBitmap, Table};
 use crate::types::Value;
 
 use super::aggregate::AggState;
-use super::compile::{
-    CompiledFilter, CompiledProjection, LocalKeyPart, RowSelection,
-};
+use super::compile::{CompiledFilter, CompiledProjection, LocalKeyPart, RowSelection};
 
 const PARALLEL_AGGREGATE_ROW_GROUPS: usize = 4;
 
@@ -19,15 +17,19 @@ pub(super) fn scan_table<F>(
     table: &Table,
     mapped: Option<&[u8]>,
     filters: &[CompiledFilter],
+    required_columns: &[usize],
     mut visitor: F,
 ) -> Result<()>
 where
-    F: FnMut(&RowGroup, usize) -> Result<()>,
+    F: FnMut(&LoadedRowGroup<'_>, usize) -> Result<()>,
 {
     for row_group in &table.row_groups {
-        let row_group = row_group.get(&table.schema, mapped)?;
-        let selection = select_rows(row_group, filters);
-        selection.try_for_each(|row| visitor(row_group, row))?;
+        if !row_group_matches(row_group.rows(), row_group.stats(), filters) {
+            continue;
+        }
+        let row_group = row_group.load(&table.schema, mapped, required_columns)?;
+        let selection = select_rows(&row_group, filters);
+        selection.try_for_each(|row| visitor(&row_group, row))?;
     }
     Ok(())
 }
@@ -39,23 +41,35 @@ fn should_parallelize_aggregate(table: &Table) -> bool {
 pub(super) fn collect_row_group_aggregates<T, F>(
     table: &Table,
     mapped: Option<&[u8]>,
+    filters: &[CompiledFilter],
+    required_columns: &[usize],
     worker: F,
 ) -> Result<Vec<T>>
 where
     T: Send,
-    F: Fn(&RowGroup) -> Result<T> + Sync + Send,
+    F: Fn(&LoadedRowGroup<'_>) -> Result<T> + Sync + Send,
 {
     let partials = if should_parallelize_aggregate(table) {
         table
             .row_groups
             .par_iter()
-            .map(|row_group| row_group.get(&table.schema, mapped).and_then(&worker))
+            .filter(|row_group| row_group_matches(row_group.rows(), row_group.stats(), filters))
+            .map(|row_group| {
+                row_group
+                    .load(&table.schema, mapped, required_columns)
+                    .and_then(|loaded| worker(&loaded))
+            })
             .collect::<Vec<_>>()
     } else {
         table
             .row_groups
             .iter()
-            .map(|row_group| row_group.get(&table.schema, mapped).and_then(&worker))
+            .filter(|row_group| row_group_matches(row_group.rows(), row_group.stats(), filters))
+            .map(|row_group| {
+                row_group
+                    .load(&table.schema, mapped, required_columns)
+                    .and_then(|loaded| worker(&loaded))
+            })
             .collect::<Vec<_>>()
     };
 
@@ -63,7 +77,7 @@ where
 }
 
 pub(super) fn aggregate_row_group_all(
-    row_group: &RowGroup,
+    row_group: &LoadedRowGroup<'_>,
     filters: &[CompiledFilter],
     projections: &[CompiledProjection],
 ) -> Result<Option<Vec<AggState>>> {
@@ -83,7 +97,7 @@ pub(super) fn aggregate_row_group_all(
 }
 
 pub(super) fn aggregate_row_group_grouped(
-    row_group: &RowGroup,
+    row_group: &LoadedRowGroup<'_>,
     filters: &[CompiledFilter],
     projections: &[CompiledProjection],
     group_indexes: &[usize],
@@ -96,7 +110,7 @@ pub(super) fn aggregate_row_group_grouped(
     selection.try_for_each(|row| {
         let key = group_indexes
             .iter()
-            .map(|index| LocalKeyPart::from_column(&row_group.columns[*index], row))
+            .map(|index| LocalKeyPart::from_column(row_group.column(*index), row))
             .collect::<Result<Vec<_>>>()?;
         let states = local_groups
             .entry(key)
@@ -115,16 +129,16 @@ pub(super) fn aggregate_row_group_grouped(
     Ok(materialized)
 }
 
-fn row_group_matches(row_group: &RowGroup, filters: &[CompiledFilter]) -> bool {
+fn row_group_matches(rows: usize, stats: &[ColumnStats], filters: &[CompiledFilter]) -> bool {
     filters.iter().all(|filter| match filter.op {
-        CompareOp::Eq => stats_may_match_eq(&row_group.stats[filter.column_index], &filter.value),
-        CompareOp::Lt => stats_may_match_lt(&row_group.stats[filter.column_index], &filter.value),
-        CompareOp::Lte => stats_may_match_lte(&row_group.stats[filter.column_index], &filter.value),
-        CompareOp::Gt => stats_may_match_gt(&row_group.stats[filter.column_index], &filter.value),
-        CompareOp::Gte => stats_may_match_gte(&row_group.stats[filter.column_index], &filter.value),
+        CompareOp::Eq => stats_may_match_eq(&stats[filter.column_index], &filter.value),
+        CompareOp::Lt => stats_may_match_lt(&stats[filter.column_index], &filter.value),
+        CompareOp::Lte => stats_may_match_lte(&stats[filter.column_index], &filter.value),
+        CompareOp::Gt => stats_may_match_gt(&stats[filter.column_index], &filter.value),
+        CompareOp::Gte => stats_may_match_gte(&stats[filter.column_index], &filter.value),
         CompareOp::NotEq => true,
-        CompareOp::IsNull => row_group.stats[filter.column_index].null_count > 0,
-        CompareOp::IsNotNull => row_group.stats[filter.column_index].null_count < row_group.rows,
+        CompareOp::IsNull => stats[filter.column_index].null_count > 0,
+        CompareOp::IsNotNull => stats[filter.column_index].null_count < rows,
     })
 }
 
@@ -177,8 +191,8 @@ fn stats_may_match_gte(stats: &ColumnStats, value: &Value) -> bool {
     }
 }
 
-fn select_rows(row_group: &RowGroup, filters: &[CompiledFilter]) -> RowSelection {
-    if !row_group_matches(row_group, filters) {
+fn select_rows(row_group: &LoadedRowGroup<'_>, filters: &[CompiledFilter]) -> RowSelection {
+    if !row_group_matches(row_group.rows, row_group.stats, filters) {
         return RowSelection::Indexes(Vec::new());
     }
     if filters.is_empty() {
@@ -195,10 +209,10 @@ fn select_rows(row_group: &RowGroup, filters: &[CompiledFilter]) -> RowSelection
     RowSelection::Indexes(selected)
 }
 
-fn apply_filter_to_all_rows(row_group: &RowGroup, filter: &CompiledFilter) -> Vec<u32> {
+fn apply_filter_to_all_rows(row_group: &LoadedRowGroup<'_>, filter: &CompiledFilter) -> Vec<u32> {
     let mut selected = Vec::with_capacity(row_group.rows);
-    let column = &row_group.columns[filter.column_index];
-    let nulls = row_group.nulls[filter.column_index].as_ref();
+    let column = row_group.column(filter.column_index);
+    let nulls = row_group.nulls(filter.column_index);
     for row in 0..row_group.rows {
         if column_matches_filter(column, row, filter, nulls) {
             selected.push(row as u32);
@@ -207,13 +221,22 @@ fn apply_filter_to_all_rows(row_group: &RowGroup, filter: &CompiledFilter) -> Ve
     selected
 }
 
-fn refine_selection(row_group: &RowGroup, filter: &CompiledFilter, selected: &mut Vec<u32>) {
-    let column = &row_group.columns[filter.column_index];
-    let nulls = row_group.nulls[filter.column_index].as_ref();
+fn refine_selection(
+    row_group: &LoadedRowGroup<'_>,
+    filter: &CompiledFilter,
+    selected: &mut Vec<u32>,
+) {
+    let column = row_group.column(filter.column_index);
+    let nulls = row_group.nulls(filter.column_index);
     selected.retain(|row| column_matches_filter(column, *row as usize, filter, nulls));
 }
 
-fn column_matches_filter(column: &ColumnData, row: usize, filter: &CompiledFilter, nulls: Option<&NullBitmap>) -> bool {
+fn column_matches_filter(
+    column: &ColumnData,
+    row: usize,
+    filter: &CompiledFilter,
+    nulls: Option<&NullBitmap>,
+) -> bool {
     match filter.op {
         CompareOp::Eq => column.compare_at(row, &filter.value) == Some(Ordering::Equal),
         CompareOp::NotEq => column.compare_at(row, &filter.value) != Some(Ordering::Equal),
@@ -231,13 +254,13 @@ fn column_matches_filter(column: &ColumnData, row: usize, filter: &CompiledFilte
 }
 
 fn materialize_group_key(
-    row_group: &RowGroup,
+    row_group: &LoadedRowGroup<'_>,
     group_indexes: &[usize],
     key: &[LocalKeyPart],
 ) -> Result<Vec<Value>> {
     let mut values = Vec::with_capacity(key.len());
     for (group_index, part) in group_indexes.iter().zip(key) {
-        let value = match (&row_group.columns[*group_index], part) {
+        let value = match (row_group.column(*group_index), part) {
             (ColumnData::Int64(_), LocalKeyPart::Int64(value)) => Value::Int64(*value),
             (ColumnData::Float64(_), LocalKeyPart::Float64(value)) => Value::Float64(*value),
             (ColumnData::Bool(_), LocalKeyPart::Bool(value)) => Value::Bool(*value),

@@ -31,6 +31,35 @@ db.insert_rows("logs", vec![vec![Value::Int64(1), Value::String("hello".into())]
 let results = db.execute_sql("SELECT * FROM logs;")?;
 ```
 
+## TCP server
+
+The repo also includes a separate runnable server crate in `crates/server`.
+
+```bash
+cargo run -p narrowdb-server -- ./logs.narrowdb --listen 127.0.0.1:5433
+```
+
+It uses newline-delimited JSON over plain TCP.
+
+Example request:
+
+```json
+{"id":1,"method":"exec","params":{"sql":"SELECT ts FROM logs LIMIT 1;"}}
+```
+
+Example response:
+
+```json
+{"id":1,"ok":true,"result":[{"columns":["ts"],"rows":[[1]]}]}
+```
+
+Supported methods:
+
+- `ping`
+- `exec`
+- `insert_columnar_batch`
+- `flush_all`
+
 ## Benchmarks
 
 1M rows, Apple Silicon, release build:

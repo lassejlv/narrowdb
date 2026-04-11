@@ -153,3 +153,35 @@ pub(super) fn column_index(schema: &Schema, column_name: &str) -> Result<usize> 
         .position(|column| column.name == column_name)
         .with_context(|| format!("unknown column {column_name}"))
 }
+
+pub(super) fn required_column_indexes(
+    schema_len: usize,
+    filters: &[CompiledFilter],
+    projections: &[CompiledProjection],
+    extra_indexes: &[usize],
+) -> Vec<usize> {
+    let mut required = vec![false; schema_len];
+    for filter in filters {
+        required[filter.column_index] = true;
+    }
+    for projection in projections {
+        match projection.expr {
+            CompiledProjectionExpr::Column { column_index, .. } => required[column_index] = true,
+            CompiledProjectionExpr::Aggregate {
+                column_index: Some(index),
+                ..
+            } => required[index] = true,
+            CompiledProjectionExpr::Aggregate {
+                column_index: None, ..
+            } => {}
+        }
+    }
+    for &index in extra_indexes {
+        required[index] = true;
+    }
+    required
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, include)| include.then_some(index))
+        .collect()
+}
