@@ -30,13 +30,15 @@ pub enum CompareOp {
     Lte,
     Gt,
     Gte,
+    IsNull,
+    IsNotNull,
 }
 
 #[derive(Debug, Clone)]
 pub struct Filter {
     pub column: String,
     pub op: CompareOp,
-    pub value: Value,
+    pub value: Option<Value>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -183,7 +185,7 @@ fn parse_select(
 
 fn parse_filters(expr: Expr) -> Result<Vec<Filter>> {
     match expr {
-        Expr::BinaryOp { left, op, right } if op == BinaryOperator::And => {
+        Expr::BinaryOp { left, op: BinaryOperator::And, right } => {
             let mut filters = parse_filters(*left)?;
             filters.extend(parse_filters(*right)?);
             Ok(filters)
@@ -200,7 +202,15 @@ fn parse_filters(expr: Expr) -> Result<Vec<Filter>> {
                 BinaryOperator::GtEq => CompareOp::Gte,
                 other => bail!("unsupported filter operator: {other}"),
             };
-            Ok(vec![Filter { column, op, value }])
+            Ok(vec![Filter { column, op, value: Some(value) }])
+        }
+        Expr::IsNull(expr) => {
+            let column = parse_identifier_expr(*expr)?;
+            Ok(vec![Filter { column, op: CompareOp::IsNull, value: None }])
+        }
+        Expr::IsNotNull(expr) => {
+            let column = parse_identifier_expr(*expr)?;
+            Ok(vec![Filter { column, op: CompareOp::IsNotNull, value: None }])
         }
         other => bail!("unsupported WHERE expression: {other}"),
     }
@@ -348,6 +358,10 @@ fn parse_sql_value_expr(expr: Expr) -> Result<Value> {
             Value::Float64(value) => Ok(Value::Float64(OrderedFloat(-value.into_inner()))),
             other => bail!("unsupported unary negation for {other:?}"),
         },
+        Expr::IsNull(_) => {
+            // IS NULL / IS NOT NULL handled as a special filter elsewhere
+            bail!("IS NULL expressions must appear in WHERE clauses")
+        }
         other => bail!("expected literal value, got {other}"),
     }
 }
@@ -365,6 +379,7 @@ fn parse_sql_value(value: sqlparser::ast::Value) -> Result<Value> {
             Ok(Value::String(value))
         }
         SqlValue::Boolean(value) => Ok(Value::Bool(value)),
+        SqlValue::Null => Ok(Value::Null),
         other => Err(anyhow!("unsupported literal value: {other}")),
     }
 }

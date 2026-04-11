@@ -195,6 +195,7 @@ pub enum Value {
     Float64(OrderedFloat<f64>),
     Bool(bool),
     String(String),
+    Null,
 }
 
 impl Value {
@@ -215,6 +216,7 @@ impl Value {
 
     pub fn compare(&self, other: &Self) -> Option<Ordering> {
         match (self, other) {
+            (Self::Null, _) | (_, Self::Null) => None,
             (Self::Int64(lhs), Self::Int64(rhs)) => Some(lhs.cmp(rhs)),
             (Self::Float64(lhs), Self::Float64(rhs)) => Some(lhs.cmp(rhs)),
             (Self::Int64(lhs), Self::Float64(rhs)) => Some(OrderedFloat(*lhs as f64).cmp(rhs)),
@@ -227,6 +229,7 @@ impl Value {
 
     pub fn cast_for(data_type: DataType, value: Value) -> Result<Value> {
         match (data_type, value) {
+            (_, Value::Null) => Ok(Value::Null),
             (DataType::Int64 | DataType::Timestamp, Value::Int64(value)) => Ok(Value::Int64(value)),
             (DataType::Float64, Value::Float64(value)) => Ok(Value::Float64(value)),
             (DataType::Float64, Value::Int64(value)) => {
@@ -246,6 +249,7 @@ impl fmt::Display for Value {
             Self::Float64(value) => write!(f, "{}", value.into_inner()),
             Self::Bool(value) => write!(f, "{value}"),
             Self::String(value) => write!(f, "{value}"),
+            Self::Null => write!(f, "NULL"),
         }
     }
 }

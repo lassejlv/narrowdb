@@ -11,7 +11,7 @@ use rustc_hash::FxHashMap;
 
 use crate::types::{BatchColumn, ColumnDef, ColumnarBatch, DataType, Schema, Value};
 
-const MAGIC: &[u8; 8] = b"NRWDB003";
+const MAGIC: &[u8; 8] = b"NRWDB004";
 const RECORD_CREATE_TABLE: u8 = 1;
 const RECORD_ROW_GROUP: u8 = 2;
 
@@ -30,50 +30,132 @@ impl Default for DbOptions {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Null bitmap: packed bit-vector where set bit = value present, clear bit = null
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NullBitmap {
+    data: Vec<u8>,
+    len: usize,
+}
+
+impl NullBitmap {
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn is_null(&self, index: usize) -> bool {
+        !self.is_present(index)
+    }
+
+    pub fn is_present(&self, index: usize) -> bool {
+        debug_assert!(index < self.len);
+        (self.data[index / 8] >> (index % 8)) & 1 != 0
+    }
+
+    pub fn from_bools(present: &[bool]) -> Self {
+        let len = present.len();
+        let byte_len = (len + 7) / 8;
+        let mut data = vec![0u8; byte_len];
+        for (i, &p) in present.iter().enumerate() {
+            if p {
+                data[i / 8] |= 1 << (i % 8);
+            }
+        }
+        Self { data, len }
+    }
+
+    pub fn null_count(&self) -> usize {
+        (0..self.len).filter(|&i| self.is_null(i)).count()
+    }
+
+    fn encode(&self) -> Vec<u8> {
+        self.data.clone()
+    }
+
+    fn decode(data: Vec<u8>, len: usize) -> Self {
+        Self { data, len }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ColumnStats {
     pub min: Option<Value>,
     pub max: Option<Value>,
+    pub null_count: usize,
 }
 
 impl ColumnStats {
-    fn from_column(column: &ColumnData) -> Self {
-        match column {
-            ColumnData::Int64(values) => Self {
-                min: values.iter().min().copied().map(Value::Int64),
-                max: values.iter().max().copied().map(Value::Int64),
-            },
-            ColumnData::Float64(values) => Self {
-                min: values.iter().min().copied().map(Value::Float64),
-                max: values.iter().max().copied().map(Value::Float64),
-            },
-            ColumnData::Bool(values) => Self {
-                min: values.iter().min().copied().map(Value::Bool),
-                max: values.iter().max().copied().map(Value::Bool),
-            },
-            ColumnData::StringPlain(values) => Self {
-                min: values.iter().min().cloned().map(Value::String),
-                max: values.iter().max().cloned().map(Value::String),
-            },
+    fn from_column(column: &ColumnData, nulls: Option<&NullBitmap>) -> Self {
+        let (min, max) = match column {
+            ColumnData::Int64(values) => {
+                let (min, max) = min_max_with_nulls(values, nulls, |v| *v);
+                (min.map(Value::Int64), max.map(Value::Int64))
+            }
+            ColumnData::Float64(values) => {
+                let (min, max) = min_max_with_nulls(values, nulls, |v| *v);
+                (min.map(Value::Float64), max.map(Value::Float64))
+            }
+            ColumnData::Bool(values) => {
+                let (min, max) = min_max_with_nulls(values, nulls, |v| *v);
+                (min.map(Value::Bool), max.map(Value::Bool))
+            }
+            ColumnData::StringPlain(values) => {
+                let (min, max) = min_max_with_nulls(values, nulls, |v| v.clone());
+                (min.map(Value::String), max.map(Value::String))
+            }
             ColumnData::StringDict { dictionary, codes } => {
                 let mut min = None;
                 let mut max = None;
-                for code in codes {
-                    let value = dictionary[*code as usize].clone();
-                    if min.as_ref().is_none_or(|current: &String| value < *current) {
+                for (i, code) in codes.iter().enumerate() {
+                    if nulls.is_some_and(|n| n.is_null(i)) {
+                        continue;
+                    }
+                    let value = &dictionary[*code as usize];
+                    if min.as_ref().is_none_or(|current: &String| value < current) {
                         min = Some(value.clone());
                     }
-                    if max.as_ref().is_none_or(|current: &String| value > *current) {
-                        max = Some(value);
+                    if max.as_ref().is_none_or(|current: &String| value > current) {
+                        max = Some(value.clone());
                     }
                 }
-                Self {
-                    min: min.map(Value::String),
-                    max: max.map(Value::String),
-                }
+                (min.map(Value::String), max.map(Value::String))
             }
+        };
+        let null_count = nulls.map(|n| n.null_count()).unwrap_or(0);
+        Self {
+            min,
+            max,
+            null_count,
         }
     }
+}
+
+fn min_max_with_nulls<T, U: Ord + Clone>(
+    values: &[T],
+    nulls: Option<&NullBitmap>,
+    f: impl Fn(&T) -> U,
+) -> (Option<U>, Option<U>) {
+    let mut min = None;
+    let mut max = None;
+    for (i, v) in values.iter().enumerate() {
+        if nulls.is_some_and(|n| n.is_null(i)) {
+            continue;
+        }
+        let key = f(v);
+        if min.as_ref().is_none_or(|m| &key < m) {
+            min = Some(key.clone());
+        }
+        if max.as_ref().is_none_or(|m| &key > m) {
+            max = Some(key);
+        }
+    }
+    (min, max)
 }
 
 #[derive(Debug, Clone)]
@@ -174,31 +256,43 @@ impl ColumnData {
 pub struct RowGroup {
     pub rows: usize,
     pub columns: Vec<ColumnData>,
+    pub nulls: Vec<Option<NullBitmap>>,
     pub stats: Vec<ColumnStats>,
 }
 
 impl RowGroup {
-    fn new(columns: Vec<ColumnData>) -> Self {
+    fn new(columns: Vec<ColumnData>, nulls: Vec<Option<NullBitmap>>) -> Self {
         let rows = columns.first().map(ColumnData::len).unwrap_or(0);
-        let stats = columns.iter().map(ColumnStats::from_column).collect();
+        let stats = columns
+            .iter()
+            .zip(nulls.iter())
+            .map(|(col, n)| ColumnStats::from_column(col, n.as_ref()))
+            .collect();
         Self {
             rows,
             columns,
+            nulls,
             stats,
         }
+    }
+
+    pub fn is_null(&self, column_index: usize, row: usize) -> bool {
+        self.nulls[column_index]
+            .as_ref()
+            .is_some_and(|n| n.is_null(row))
     }
 }
 
 #[derive(Debug)]
 pub struct StoredRowGroup {
     decoded: OnceCell<RowGroup>,
-    source: StoredRowGroupSource,
+    source: Option<StoredRowGroupSource>,
 }
 
 #[derive(Debug)]
-enum StoredRowGroupSource {
-    InMemory,
-    Mapped { offset: usize, len: usize },
+struct StoredRowGroupSource {
+    offset: usize,
+    len: usize,
 }
 
 impl StoredRowGroup {
@@ -206,17 +300,17 @@ impl StoredRowGroup {
         let decoded = OnceCell::new();
         decoded
             .set(row_group)
-            .expect("fresh OnceLock accepts row group");
+            .expect("fresh OnceCell accepts row group");
         Self {
             decoded,
-            source: StoredRowGroupSource::InMemory,
+            source: None,
         }
     }
 
     pub fn from_mapped(offset: usize, len: usize) -> Self {
         Self {
             decoded: OnceCell::new(),
-            source: StoredRowGroupSource::Mapped { offset, len },
+            source: Some(StoredRowGroupSource { offset, len }),
         }
     }
 
@@ -225,48 +319,79 @@ impl StoredRowGroup {
             return Ok(row_group);
         }
 
-        match self.source {
-            StoredRowGroupSource::InMemory => self
-                .decoded
-                .get()
-                .context("in-memory row group missing decoded state"),
-            StoredRowGroupSource::Mapped { offset, len } => {
-                let mapped = mapped.context("mapped storage unavailable for lazy row group")?;
-                let payload = mapped
-                    .get(offset..offset + len)
-                    .context("row group payload out of bounds")?;
-                self.decoded
-                    .get_or_try_init(|| decode_row_group(payload, schema))
-            }
-        }
+        let source = self
+            .source
+            .as_ref()
+            .context("in-memory row group should already be decoded")?;
+        let mapped = mapped.context("mapped storage unavailable for lazy row group")?;
+        let payload = mapped
+            .get(source.offset..source.offset + source.len)
+            .context("row group payload out of bounds")?;
+        self.decoded
+            .get_or_try_init(|| decode_row_group(payload, schema))
     }
 }
 
 #[derive(Debug, Clone)]
 pub enum ColumnBuilder {
-    Int64(Vec<i64>),
-    Float64(Vec<OrderedFloat<f64>>),
-    Bool(Vec<bool>),
-    String(Vec<String>),
+    Int64(Vec<i64>, Vec<bool>),
+    Float64(Vec<OrderedFloat<f64>>, Vec<bool>),
+    Bool(Vec<bool>, Vec<bool>),
+    String(Vec<String>, Vec<bool>),
 }
 
 impl ColumnBuilder {
     pub fn with_capacity(data_type: DataType, capacity: usize) -> Self {
         match data_type {
-            DataType::Int64 | DataType::Timestamp => Self::Int64(Vec::with_capacity(capacity)),
-            DataType::Float64 => Self::Float64(Vec::with_capacity(capacity)),
-            DataType::Bool => Self::Bool(Vec::with_capacity(capacity)),
-            DataType::String => Self::String(Vec::with_capacity(capacity)),
+            DataType::Int64 | DataType::Timestamp => {
+                Self::Int64(Vec::with_capacity(capacity), Vec::with_capacity(capacity))
+            }
+            DataType::Float64 => {
+                Self::Float64(Vec::with_capacity(capacity), Vec::with_capacity(capacity))
+            }
+            DataType::Bool => {
+                Self::Bool(Vec::with_capacity(capacity), Vec::with_capacity(capacity))
+            }
+            DataType::String => {
+                Self::String(Vec::with_capacity(capacity), Vec::with_capacity(capacity))
+            }
         }
     }
 
     pub fn append(&mut self, value: Value) -> Result<()> {
         match (self, value) {
-            (Self::Int64(values), Value::Int64(value)) => values.push(value),
-            (Self::Float64(values), Value::Float64(value)) => values.push(value),
-            (Self::Float64(values), Value::Int64(value)) => values.push(OrderedFloat(value as f64)),
-            (Self::Bool(values), Value::Bool(value)) => values.push(value),
-            (Self::String(values), Value::String(value)) => values.push(value),
+            (Self::Int64(values, nulls), Value::Int64(value)) => {
+                values.push(value);
+                nulls.push(true);
+            }
+            (Self::Int64(values, nulls), Value::Null) => {
+                values.push(0);
+                nulls.push(false);
+            }
+            (Self::Float64(values, nulls), Value::Float64(value)) => {
+                values.push(value);
+                nulls.push(true);
+            }
+            (Self::Float64(values, nulls), Value::Null) => {
+                values.push(OrderedFloat(0.0));
+                nulls.push(false);
+            }
+            (Self::Bool(values, nulls), Value::Bool(value)) => {
+                values.push(value);
+                nulls.push(true);
+            }
+            (Self::Bool(values, nulls), Value::Null) => {
+                values.push(false);
+                nulls.push(false);
+            }
+            (Self::String(values, nulls), Value::String(value)) => {
+                values.push(value);
+                nulls.push(true);
+            }
+            (Self::String(values, nulls), Value::Null) => {
+                values.push(String::new());
+                nulls.push(false);
+            }
             (builder, value) => bail!("cannot append {value:?} into {builder:?}"),
         }
         Ok(())
@@ -274,31 +399,78 @@ impl ColumnBuilder {
 
     pub fn len(&self) -> usize {
         match self {
-            Self::Int64(values) => values.len(),
-            Self::Float64(values) => values.len(),
-            Self::Bool(values) => values.len(),
-            Self::String(values) => values.len(),
+            Self::Int64(values, _) => values.len(),
+            Self::Float64(values, _) => values.len(),
+            Self::Bool(values, _) => values.len(),
+            Self::String(values, _) => values.len(),
         }
     }
 
-    pub fn finish(&mut self) -> ColumnData {
+    pub fn finish(&mut self) -> (ColumnData, Option<NullBitmap>) {
         match self {
-            Self::Int64(values) => ColumnData::Int64(std::mem::take(values)),
-            Self::Float64(values) => ColumnData::Float64(std::mem::take(values)),
-            Self::Bool(values) => ColumnData::Bool(std::mem::take(values)),
-            Self::String(values) => build_string_column(std::mem::take(values)),
+            Self::Int64(values, nulls) => {
+                let data = ColumnData::Int64(std::mem::take(values));
+                let bitmap = if nulls.iter().all(|&p| p) {
+                    None
+                } else {
+                    Some(NullBitmap::from_bools(nulls))
+                };
+                (data, bitmap)
+            }
+            Self::Float64(values, nulls) => {
+                let data = ColumnData::Float64(std::mem::take(values));
+                let bitmap = if nulls.iter().all(|&p| p) {
+                    None
+                } else {
+                    Some(NullBitmap::from_bools(nulls))
+                };
+                (data, bitmap)
+            }
+            Self::Bool(values, nulls) => {
+                let data = ColumnData::Bool(std::mem::take(values));
+                let bitmap = if nulls.iter().all(|&p| p) {
+                    None
+                } else {
+                    Some(NullBitmap::from_bools(nulls))
+                };
+                (data, bitmap)
+            }
+            Self::String(values, nulls) => {
+                let data = build_string_column(std::mem::take(values));
+                let bitmap = if nulls.iter().all(|&p| p) {
+                    None
+                } else {
+                    // For StringDict, the null bitmap refers to the original row positions
+                    // (before dictionary encoding), so it's still valid.
+                    Some(NullBitmap::from_bools(nulls))
+                };
+                (data, bitmap)
+            }
         }
     }
 
     pub fn append_batch_column(&mut self, column: BatchColumn) -> Result<()> {
         match (self, column) {
-            (Self::Int64(values), BatchColumn::Int64(mut batch))
-            | (Self::Int64(values), BatchColumn::Timestamp(mut batch)) => values.append(&mut batch),
-            (Self::Float64(values), BatchColumn::Float64(batch)) => {
-                values.extend(batch.into_iter().map(OrderedFloat));
+            (Self::Int64(values, nulls), BatchColumn::Int64(mut batch))
+            | (Self::Int64(values, nulls), BatchColumn::Timestamp(mut batch)) => {
+                values.append(&mut batch);
+                nulls.extend(std::iter::repeat_n(true, batch.len()));
             }
-            (Self::Bool(values), BatchColumn::Bool(mut batch)) => values.append(&mut batch),
-            (Self::String(values), BatchColumn::String(mut batch)) => values.append(&mut batch),
+            (Self::Float64(values, nulls), BatchColumn::Float64(batch)) => {
+                let len = batch.len();
+                values.extend(batch.into_iter().map(OrderedFloat));
+                nulls.extend(std::iter::repeat_n(true, len));
+            }
+            (Self::Bool(values, nulls), BatchColumn::Bool(mut batch)) => {
+                let len = batch.len();
+                values.append(&mut batch);
+                nulls.extend(std::iter::repeat_n(true, len));
+            }
+            (Self::String(values, nulls), BatchColumn::String(mut batch)) => {
+                let len = batch.len();
+                values.append(&mut batch);
+                nulls.extend(std::iter::repeat_n(true, len));
+            }
             (builder, batch) => bail!("cannot append batch column {batch:?} into {builder:?}"),
         }
         Ok(())
@@ -334,8 +506,9 @@ impl PendingBatch {
     }
 
     pub fn take_row_group(&mut self) -> RowGroup {
-        let columns = self.columns.iter_mut().map(ColumnBuilder::finish).collect();
-        RowGroup::new(columns)
+        let (columns, nulls): (Vec<_>, Vec<_>) =
+            self.columns.iter_mut().map(ColumnBuilder::finish).unzip();
+        RowGroup::new(columns, nulls)
     }
 
     pub fn append_columnar_batch(&mut self, batch: ColumnarBatch) -> Result<()> {
@@ -374,7 +547,8 @@ pub(crate) fn row_group_from_columnar_batch(batch: ColumnarBatch) -> Result<RowG
         .into_iter()
         .map(column_data_from_batch_column)
         .collect::<Result<Vec<_>>>()?;
-    Ok(RowGroup::new(columns))
+    let nulls = vec![None; columns.len()];
+    Ok(RowGroup::new(columns, nulls))
 }
 
 fn column_data_from_batch_column(column: BatchColumn) -> Result<ColumnData> {
@@ -564,7 +738,21 @@ fn encode_row_group(table_name: &str, row_group: &RowGroup, schema: &Schema) -> 
     let mut bytes = Vec::new();
     write_string(&mut bytes, table_name)?;
     write_u32(&mut bytes, row_group.rows as u32);
-    for (column, column_def) in row_group.columns.iter().zip(&schema.columns) {
+    for ((column, null_bitmap), column_def) in row_group
+        .columns
+        .iter()
+        .zip(&row_group.nulls)
+        .zip(&schema.columns)
+    {
+        // Encode null bitmap: 1 byte flag, then packed bits if present
+        if let Some(bitmap) = null_bitmap {
+            bytes.push(1); // has nulls
+            write_u32(&mut bytes, bitmap.len as u32);
+            bytes.extend_from_slice(&bitmap.encode());
+        } else {
+            bytes.push(0); // no nulls
+        }
+
         match (column, column_def.data_type) {
             (ColumnData::Int64(values), DataType::Int64 | DataType::Timestamp) => {
                 for value in values {
@@ -609,8 +797,26 @@ fn decode_row_group(payload: &[u8], schema: &Schema) -> Result<RowGroup> {
     ensure!(table_name == schema.table_name, "row group table mismatch");
     let rows = read_u32(payload, &mut cursor)? as usize;
     let mut columns = Vec::with_capacity(schema.columns.len());
+    let mut nulls = Vec::with_capacity(schema.columns.len());
 
     for column in &schema.columns {
+        // Decode null bitmap
+        let null_bitmap = match read_u8(payload, &mut cursor)? {
+            0 => None,
+            1 => {
+                let bitmap_len = read_u32(payload, &mut cursor)? as usize;
+                let byte_len = (bitmap_len + 7) / 8;
+                ensure!(
+                    cursor + byte_len <= payload.len(),
+                    "null bitmap out of bounds"
+                );
+                let bitmap_data = payload[cursor..cursor + byte_len].to_vec();
+                cursor += byte_len;
+                Some(NullBitmap::decode(bitmap_data, bitmap_len))
+            }
+            other => bail!("unknown null bitmap flag: {other}"),
+        };
+
         let data = match column.data_type {
             DataType::Int64 | DataType::Timestamp => {
                 let mut values = Vec::with_capacity(rows);
@@ -657,9 +863,10 @@ fn decode_row_group(payload: &[u8], schema: &Schema) -> Result<RowGroup> {
             },
         };
         columns.push(data);
+        nulls.push(null_bitmap);
     }
 
-    Ok(RowGroup::new(columns))
+    Ok(RowGroup::new(columns, nulls))
 }
 
 fn write_string(bytes: &mut Vec<u8>, value: &str) -> Result<()> {
