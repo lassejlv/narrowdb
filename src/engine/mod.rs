@@ -8,11 +8,15 @@ use std::path::Path;
 use anyhow::{Context, Result, bail, ensure};
 use rustc_hash::FxHashMap;
 
-use crate::sql::{Command, InsertPlan, OrderByPlan, ProjectionExpr, SelectPlan, parse_sql};
+use crate::sql::{
+    ArithmeticOp, Command, EvalPlan, InsertPlan, OrderByPlan, ProjectionExpr, ScalarExpr,
+    SelectPlan, parse_sql,
+};
 use crate::storage::{
     DbOptions, PendingBatch, Storage, StoredRowGroup, Table, row_group_from_columnar_batch,
 };
 use crate::types::{ColumnarBatch, Schema, Value};
+use ordered_float::OrderedFloat;
 
 use aggregate::AggState;
 use compile::{
@@ -233,6 +237,9 @@ impl NarrowDb {
                 Command::Select(plan) => {
                     self.flush_table(&plan.table_name)?;
                     results.push(self.execute_select(plan)?);
+                }
+                Command::Eval(plan) => {
+                    results.push(execute_eval(plan)?);
                 }
             }
         }
@@ -474,6 +481,74 @@ fn apply_order_by_and_limit(
         }
     }
     Ok(())
+}
+
+fn execute_eval(plan: EvalPlan) -> Result<QueryResult> {
+    let mut columns = Vec::new();
+    let mut values = Vec::new();
+    for (expr, alias) in plan.exprs {
+        columns.push(alias);
+        values.push(eval_scalar(&expr)?);
+    }
+    Ok(QueryResult {
+        columns,
+        rows: vec![values],
+    })
+}
+
+fn eval_scalar(expr: &ScalarExpr) -> Result<Value> {
+    match expr {
+        ScalarExpr::Literal(value) => Ok(value.clone()),
+        ScalarExpr::UnaryMinus(inner) => match eval_scalar(inner)? {
+            Value::Int64(v) => Ok(Value::Int64(-v)),
+            Value::Float64(v) => Ok(Value::Float64(OrderedFloat(-v.into_inner()))),
+            other => bail!("cannot negate {other:?}"),
+        },
+        ScalarExpr::BinaryOp { left, op, right } => {
+            let l = eval_scalar(left)?;
+            let r = eval_scalar(right)?;
+            eval_arithmetic(l, *op, r)
+        }
+    }
+}
+
+fn eval_arithmetic(left: Value, op: ArithmeticOp, right: Value) -> Result<Value> {
+    match (left, right) {
+        (Value::Int64(l), Value::Int64(r)) => {
+            let result = match op {
+                ArithmeticOp::Add => l.checked_add(r).context("integer overflow")?,
+                ArithmeticOp::Sub => l.checked_sub(r).context("integer overflow")?,
+                ArithmeticOp::Mul => l.checked_mul(r).context("integer overflow")?,
+                ArithmeticOp::Div => {
+                    ensure!(r != 0, "division by zero");
+                    l / r
+                }
+                ArithmeticOp::Mod => {
+                    ensure!(r != 0, "division by zero");
+                    l % r
+                }
+            };
+            Ok(Value::Int64(result))
+        }
+        (Value::Float64(l), Value::Float64(r)) => {
+            let (l, r) = (l.into_inner(), r.into_inner());
+            let result = match op {
+                ArithmeticOp::Add => l + r,
+                ArithmeticOp::Sub => l - r,
+                ArithmeticOp::Mul => l * r,
+                ArithmeticOp::Div => l / r,
+                ArithmeticOp::Mod => l % r,
+            };
+            Ok(Value::Float64(OrderedFloat(result)))
+        }
+        (Value::Int64(l), Value::Float64(r)) => {
+            eval_arithmetic(Value::Float64(OrderedFloat(l as f64)), op, Value::Float64(r))
+        }
+        (Value::Float64(l), Value::Int64(r)) => {
+            eval_arithmetic(Value::Float64(l), op, Value::Float64(OrderedFloat(r as f64)))
+        }
+        (l, r) => bail!("unsupported arithmetic between {l:?} and {r:?}"),
+    }
 }
 
 fn compare_result_rows(lhs: &[Value], rhs: &[Value], index: usize, descending: bool) -> Ordering {

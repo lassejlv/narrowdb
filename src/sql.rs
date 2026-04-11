@@ -14,6 +14,7 @@ pub enum Command {
     CreateTable(Schema),
     Insert(InsertPlan),
     Select(SelectPlan),
+    Eval(EvalPlan),
 }
 
 #[derive(Debug)]
@@ -81,6 +82,31 @@ pub struct SelectPlan {
     pub limit: Option<usize>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum ArithmeticOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+}
+
+#[derive(Debug, Clone)]
+pub enum ScalarExpr {
+    Literal(Value),
+    BinaryOp {
+        left: Box<ScalarExpr>,
+        op: ArithmeticOp,
+        right: Box<ScalarExpr>,
+    },
+    UnaryMinus(Box<ScalarExpr>),
+}
+
+#[derive(Debug)]
+pub struct EvalPlan {
+    pub exprs: Vec<(ScalarExpr, String)>,
+}
+
 pub fn parse_sql(sql: &str) -> Result<Vec<Command>> {
     let dialect = SQLiteDialect {};
     let statements = Parser::parse_sql(&dialect, sql)?;
@@ -138,6 +164,11 @@ fn parse_query(query: Query) -> Result<Command> {
         SetExpr::Select(select) => select,
         other => bail!("unsupported query body: {other}"),
     };
+
+    if select.from.is_empty() {
+        return parse_eval(*select);
+    }
+
     let plan = parse_select(*select, query.order_by, query.limit)?;
     Ok(Command::Select(plan))
 }
@@ -405,4 +436,47 @@ fn object_name_to_string(parts: &[Ident]) -> Result<String> {
         bail!("empty object name")
     };
     Ok(last.value.clone())
+}
+
+fn parse_eval(select: Select) -> Result<Command> {
+    let mut exprs = Vec::new();
+    for item in select.projection {
+        match item {
+            SelectItem::UnnamedExpr(expr) => {
+                let alias = expr.to_string();
+                exprs.push((parse_scalar_expr(expr)?, alias));
+            }
+            SelectItem::ExprWithAlias { expr, alias } => {
+                exprs.push((parse_scalar_expr(expr)?, alias.value));
+            }
+            other => bail!("unsupported expression in SELECT: {other}"),
+        }
+    }
+    Ok(Command::Eval(EvalPlan { exprs }))
+}
+
+fn parse_scalar_expr(expr: Expr) -> Result<ScalarExpr> {
+    match expr {
+        Expr::Value(value) => Ok(ScalarExpr::Literal(parse_sql_value(value)?)),
+        Expr::BinaryOp { left, op, right } => {
+            let arith_op = match op {
+                BinaryOperator::Plus => ArithmeticOp::Add,
+                BinaryOperator::Minus => ArithmeticOp::Sub,
+                BinaryOperator::Multiply => ArithmeticOp::Mul,
+                BinaryOperator::Divide => ArithmeticOp::Div,
+                BinaryOperator::Modulo => ArithmeticOp::Mod,
+                other => bail!("unsupported operator in expression: {other}"),
+            };
+            Ok(ScalarExpr::BinaryOp {
+                left: Box::new(parse_scalar_expr(*left)?),
+                op: arith_op,
+                right: Box::new(parse_scalar_expr(*right)?),
+            })
+        }
+        Expr::UnaryOp { op, expr } if op.to_string() == "-" => {
+            Ok(ScalarExpr::UnaryMinus(Box::new(parse_scalar_expr(*expr)?)))
+        }
+        Expr::Nested(inner) => parse_scalar_expr(*inner),
+        other => bail!("unsupported expression: {other}"),
+    }
 }
