@@ -1,7 +1,8 @@
+#[doc(hidden)]
 pub mod bench;
 pub mod engine;
-pub mod sql;
-pub mod storage;
+pub(crate) mod sql;
+pub(crate) mod storage;
 pub mod types;
 
 pub use engine::{NarrowDb, QueryResult};

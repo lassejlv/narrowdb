@@ -41,10 +41,12 @@ pub struct NullBitmap {
 }
 
 impl NullBitmap {
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.len
     }
 
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -276,6 +278,7 @@ impl RowGroup {
         }
     }
 
+    #[allow(dead_code)]
     pub fn is_null(&self, column_index: usize, row: usize) -> bool {
         self.nulls[column_index]
             .as_ref()
