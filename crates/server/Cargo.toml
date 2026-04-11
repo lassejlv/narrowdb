@@ -10,7 +10,7 @@ repository = "https://github.com/lassejlv/narrowdb"
 anyhow = "1.0"
 async-trait = "0.1"
 futures = "0.3"
-narrowdb = { path = "../..", version = "0.2.0" }
+narrowdb = { path = "../..", version = "0.3.0" }
 pgwire = { version = "0.38.3", default-features = false, features = ["server-api"] }
 sqlparser = "0.53"
 tokio = { version = "1.48", features = ["macros", "net", "rt-multi-thread", "sync"] }
