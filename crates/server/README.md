@@ -1,75 +1,72 @@
 # narrowdb-server
 
-External TCP server for the `narrowdb` embedded engine.
+PostgreSQL wire-compatible server for the [narrowdb](https://github.com/lassejlv/narrowdb) embedded columnar engine. Connect with any PostgreSQL client (`psql`, database GUIs, language drivers) and run SQL queries against your NarrowDB databases.
 
-## Run
+## Installation
 
 ```bash
-cargo run -p narrowdb-server -- ./logs.narrowdb --listen 127.0.0.1:5433
+cargo install narrowdb-server
 ```
 
-Optional flags:
+## Usage
 
-- `--listen 127.0.0.1:5433`
-- `--row-group-size 16384`
-- `--sync-on-flush true|false`
-
-## Protocol
-
-The server speaks newline-delimited JSON over TCP.
-
-### Request envelope
-
-```json
-{"id":1,"method":"ping","params":{}}
+```bash
+narrowdb-server <db-file> [options]
 ```
 
-### Response envelope
+## Configuration
 
-```json
-{"id":1,"ok":true,"result":{"pong":true,"version":"0.1.1"}}
+| Flag | Default | Description |
+|------|---------|-------------|
+| `<db-file>` | *required* | Path to the NarrowDB database file |
+| `--listen` | `127.0.0.1:5433` | Address and port to bind |
+| `--row-group-size` | `16384` | Rows per columnar row group |
+| `--sync-on-flush` | `true` | Fsync data to disk on flush (`true`/`false`) |
+| `--user` | `narrowdb` | Username for PostgreSQL MD5 auth |
+| `--password` | `narrowdb` | Password for PostgreSQL MD5 auth |
+
+### Example
+
+```bash
+narrowdb-server ./logs.narrowdb --listen 0.0.0.0:5433 --user admin --password s3cret
 ```
 
-Error response:
+## Connecting
 
-```json
-{"id":1,"ok":false,"error":"unknown method: nope"}
+```bash
+PGPASSWORD=s3cret psql "host=127.0.0.1 port=5433 user=admin dbname=logs"
 ```
 
-### Methods
-
-`ping`
-
-```json
-{"id":1,"method":"ping"}
+```sql
+CREATE TABLE logs (ts TIMESTAMP, service TEXT, status INT);
+INSERT INTO logs VALUES (1, 'api', 200);
+SELECT * FROM logs WHERE status = 200;
 ```
 
-`exec`
+## Docker
 
-```json
-{"id":2,"method":"exec","params":{"sql":"SELECT ts FROM logs LIMIT 1;"}}
+Build from the repository root:
+
+```bash
+docker build -f crates/server/Dockerfile -t narrowdb-server .
 ```
 
-`insert_columnar_batch`
+Run with a volume for data persistence:
 
-```json
-{
-  "id": 3,
-  "method": "insert_columnar_batch",
-  "params": {
-    "table": "logs",
-    "batch": {
-      "columns": [
-        { "kind": "timestamp", "ints": [1, 2, 3] },
-        { "kind": "string", "strings": ["api", "worker", "api"] }
-      ]
-    }
-  }
-}
+```bash
+docker run -v narrowdb-data:/data -p 5433:5433 narrowdb-server
 ```
 
-`flush_all`
+Override defaults with CLI flags:
 
-```json
-{"id":4,"method":"flush_all"}
+```bash
+docker run -v narrowdb-data:/data -p 5433:5433 narrowdb-server \
+  /data/mydb.narrowdb --listen 0.0.0.0:5433 --user admin --password s3cret
 ```
+
+## Protocol support
+
+- PostgreSQL MD5 password authentication
+- Simple query protocol
+- Extended query protocol (non-parameterized single statements)
+- Parameterized prepared statements are not yet supported

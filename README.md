@@ -36,29 +36,24 @@ let results = db.execute_sql("SELECT * FROM logs;")?;
 The repo also includes a separate runnable server crate in `crates/server`.
 
 ```bash
-cargo run -p narrowdb-server -- ./logs.narrowdb --listen 127.0.0.1:5433
+cargo run -p narrowdb-server -- ./logs.narrowdb --listen 127.0.0.1:5433 --user narrowdb --password secret
 ```
 
-It uses newline-delimited JSON over plain TCP.
+It speaks the PostgreSQL wire protocol over TCP with password auth.
 
-Example request:
+Example connection:
 
-```json
-{"id":1,"method":"exec","params":{"sql":"SELECT ts FROM logs LIMIT 1;"}}
+```bash
+PGPASSWORD=secret psql "host=127.0.0.1 port=5433 user=narrowdb dbname=logs"
 ```
 
-Example response:
+Example SQL:
 
-```json
-{"id":1,"ok":true,"result":[{"columns":["ts"],"rows":[[1]]}]}
+```sql
+CREATE TABLE logs (ts TIMESTAMP, service TEXT, status INT);
+INSERT INTO logs VALUES (1, 'api', 200);
+SELECT * FROM logs;
 ```
-
-Supported methods:
-
-- `ping`
-- `exec`
-- `insert_columnar_batch`
-- `flush_all`
 
 ## Benchmarks
 
