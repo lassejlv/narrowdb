@@ -86,7 +86,7 @@ jobs:
         working-directory: crates/narrow-napi
 
       - name: Move artifacts
-        run: npx napi artifacts --output-dir ./npm
+        run: npx napi artifacts --output-dir ./artifacts --npm-dir ./npm
         working-directory: crates/narrow-napi
 
       - name: Verify platform package artifacts
