@@ -89,6 +89,49 @@ jobs:
         run: npx napi artifacts --output-dir ./npm
         working-directory: crates/narrow-napi
 
+      - name: Verify platform package artifacts
+        working-directory: crates/narrow-napi
+        run: |
+          node -e '
+            const fs = require("node:fs");
+            const path = require("node:path");
+
+            const npmDir = path.resolve("npm");
+            const packageDirs = fs
+              .readdirSync(npmDir, { withFileTypes: true })
+              .filter((entry) => entry.isDirectory())
+              .map((entry) => path.join(npmDir, entry.name));
+
+            const failures = [];
+
+            for (const dir of packageDirs) {
+              const packageJsonPath = path.join(dir, "package.json");
+              const pkg = JSON.parse(fs.readFileSync(packageJsonPath, "utf8"));
+
+              if (!pkg.main) {
+                failures.push(`${path.relative(process.cwd(), dir)} is missing a main field`);
+                continue;
+              }
+
+              const artifactPath = path.join(dir, pkg.main);
+              if (!fs.existsSync(artifactPath)) {
+                failures.push(
+                  `${path.relative(process.cwd(), dir)} is missing ${pkg.main}`
+                );
+              }
+            }
+
+            if (failures.length > 0) {
+              console.error("Refusing to publish incomplete platform packages:");
+              for (const failure of failures) {
+                console.error(`- ${failure}`);
+              }
+              process.exit(1);
+            }
+
+            console.log(`Verified ${packageDirs.length} platform package artifacts.`);
+          '
+
       - name: List packages
         run: ls -R npm/
         working-directory: crates/narrow-napi
