@@ -1,0 +1,20 @@
+[package]
+name = "narrow-napi"
+version = "0.1.0"
+edition = "2021"
+description = "Node.js bindings for the NarrowDB columnar database engine"
+license = "MIT"
+repository = "https://github.com/lassejlv/narrowdb"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+napi = { version = "3", features = ["napi9"] }
+napi-derive = "3"
+anyhow = "1.0"
+narrowdb = { path = "../..", version = "0.3.0" }
+ordered-float = "4.6"
+
+[build-dependencies]
+napi-build = "2"

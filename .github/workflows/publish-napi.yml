@@ -1,0 +1,95 @@
+name: Publish @narrowdb/node
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: crates/narrow-napi
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install zig
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        uses: mlugg/setup-zig@v1
+
+      - name: Install cargo-zigbuild
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: cargo install --locked cargo-zigbuild
+
+      - run: npm install
+      - name: Build
+        run: npx napi build --platform --release --target ${{ matrix.target }} ${{ matrix.target == 'aarch64-unknown-linux-gnu' && '--zig' || '' }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bindings-${{ matrix.target }}
+          path: crates/narrow-napi/*.node
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - run: npm install
+        working-directory: crates/narrow-napi
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: crates/narrow-napi/artifacts
+
+      - name: Move artifacts
+        run: npx napi artifacts --output-dir ./npm
+        working-directory: crates/narrow-napi
+
+      - name: List packages
+        run: ls -R npm/
+        working-directory: crates/narrow-napi
+
+      - name: Publish platform packages
+        working-directory: crates/narrow-napi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          for pkg in npm/*/; do
+            npm publish "$pkg" --access public
+          done
+
+      - name: Publish main package
+        working-directory: crates/narrow-napi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public

@@ -25,7 +25,7 @@ required-features = ["bench-duckdb"]
 bench-duckdb = ["dep:duckdb"]
 
 [workspace]
-members = ["crates/server"]
+members = ["crates/server", "crates/narrow-napi"]
 resolver = "2"
 
 [dependencies]

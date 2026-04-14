@@ -1,0 +1,20 @@
+{
+  "name": "@narrowdb/node-darwin-x64",
+  "version": "0.1.0",
+  "cpu": [
+    "x64"
+  ],
+  "main": "narrowdb.darwin-x64.node",
+  "files": [
+    "narrowdb.darwin-x64.node"
+  ],
+  "description": "Node.js bindings for the NarrowDB columnar database engine",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lassejlv/narrowdb"
+  },
+  "os": [
+    "darwin"
+  ]
+}

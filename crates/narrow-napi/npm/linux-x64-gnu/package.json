@@ -1,0 +1,23 @@
+{
+  "name": "@narrowdb/node-linux-x64-gnu",
+  "version": "0.1.0",
+  "cpu": [
+    "x64"
+  ],
+  "main": "narrowdb.linux-x64-gnu.node",
+  "files": [
+    "narrowdb.linux-x64-gnu.node"
+  ],
+  "description": "Node.js bindings for the NarrowDB columnar database engine",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lassejlv/narrowdb"
+  },
+  "os": [
+    "linux"
+  ],
+  "libc": [
+    "glibc"
+  ]
+}
