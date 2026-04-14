@@ -191,6 +191,35 @@ CREATE TABLE table_name (
 );
 ```
 
+### ALTER TABLE
+
+```sql
+ALTER TABLE table_name RENAME TO new_table_name;
+ALTER TABLE table_name RENAME COLUMN old_name TO new_name;
+```
+
+`ALTER TABLE` currently supports exactly one operation per statement.
+
+### DROP TABLE
+
+```sql
+DROP TABLE table_name;
+DROP TABLE IF EXISTS table_name;
+```
+
+### SHOW TABLES
+
+```sql
+SHOW TABLES;
+```
+
+### DESCRIBE
+
+```sql
+DESCRIBE table_name;
+DESC table_name;
+```
+
 ### INSERT
 
 ```sql

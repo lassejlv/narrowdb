@@ -5,8 +5,8 @@ mod scan;
 
 use std::cmp::Ordering;
 use std::path::Path;
-use std::sync::{Arc, Mutex, RwLock};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -14,13 +14,13 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use rustc_hash::FxHashMap;
 
 use crate::sql::{
-    ArithmeticOp, Command, EvalPlan, OrderByPlan, ProjectionExpr, ScalarExpr,
-    SelectPlan, parse_sql,
+    AlterTableOperationPlan, AlterTablePlan, ArithmeticOp, Command, EvalPlan, OrderByPlan,
+    ProjectionExpr, ScalarExpr, SelectPlan, parse_sql,
 };
 use crate::storage::{
     DbOptions, PendingBatch, Storage, StoredRowGroup, Table, row_group_from_columnar_batch,
 };
-use crate::types::{ColumnarBatch, Schema, Value};
+use crate::types::{ColumnarBatch, DataType, Schema, Value};
 use ordered_float::OrderedFloat;
 
 use aggregate::AggState;
@@ -110,11 +110,7 @@ impl NarrowDb {
         inner.insert_rows_inner(table_name, rows)
     }
 
-    pub fn insert_columnar_batch(
-        &self,
-        table_name: &str,
-        batch: ColumnarBatch,
-    ) -> Result<()> {
+    pub fn insert_columnar_batch(&self, table_name: &str, batch: ColumnarBatch) -> Result<()> {
         let mut inner = self.inner.write().map_err(|_| anyhow!("lock poisoned"))?;
         inner.insert_columnar_batch_inner(table_name, batch)
     }
@@ -354,6 +350,146 @@ impl DbInner {
         Ok(())
     }
 
+    fn alter_table_inner(&mut self, plan: AlterTablePlan) -> Result<()> {
+        self.flush_all_inner()?;
+
+        match plan.operation {
+            AlterTableOperationPlan::RenameTable { new_table_name } => {
+                self.rename_table_inner(&plan.table_name, &new_table_name, plan.if_exists)
+            }
+            AlterTableOperationPlan::RenameColumn {
+                old_column_name,
+                new_column_name,
+            } => self.rename_column_inner(
+                &plan.table_name,
+                &old_column_name,
+                &new_column_name,
+                plan.if_exists,
+            ),
+        }
+    }
+
+    fn rename_table_inner(
+        &mut self,
+        table_name: &str,
+        new_table_name: &str,
+        if_exists: bool,
+    ) -> Result<()> {
+        if !self.tables.contains_key(table_name) {
+            if if_exists {
+                return Ok(());
+            }
+            bail!("unknown table {table_name}");
+        }
+
+        if table_name == new_table_name {
+            return Ok(());
+        }
+
+        ensure!(
+            !self.tables.contains_key(new_table_name),
+            "table {new_table_name} already exists"
+        );
+
+        let mut table = self
+            .tables
+            .remove(table_name)
+            .expect("table existence checked above");
+        table.schema.table_name = new_table_name.to_string();
+        self.tables.insert(new_table_name.to_string(), table);
+        self.storage.rewrite_with_tables(&mut self.tables)?;
+        Ok(())
+    }
+
+    fn rename_column_inner(
+        &mut self,
+        table_name: &str,
+        old_column_name: &str,
+        new_column_name: &str,
+        if_exists: bool,
+    ) -> Result<()> {
+        let Some(table) = self.tables.get_mut(table_name) else {
+            if if_exists {
+                return Ok(());
+            }
+            bail!("unknown table {table_name}");
+        };
+
+        let Some(column_index) = table
+            .schema
+            .columns
+            .iter()
+            .position(|column| column.name == old_column_name)
+        else {
+            bail!("unknown column {old_column_name} in table {table_name}");
+        };
+
+        if old_column_name != new_column_name {
+            ensure!(
+                !table
+                    .schema
+                    .columns
+                    .iter()
+                    .any(|column| column.name == new_column_name),
+                "column {new_column_name} already exists in table {table_name}"
+            );
+            table.schema.columns[column_index].name = new_column_name.to_string();
+        }
+
+        self.storage.rewrite_with_tables(&mut self.tables)?;
+        Ok(())
+    }
+
+    fn drop_table_inner(&mut self, table_name: &str, if_exists: bool) -> Result<()> {
+        self.flush_all_inner()?;
+
+        if self.tables.remove(table_name).is_none() {
+            if if_exists {
+                return Ok(());
+            }
+            bail!("unknown table {table_name}");
+        }
+
+        self.storage.rewrite_with_tables(&mut self.tables)?;
+        Ok(())
+    }
+
+    fn show_tables_inner(&self) -> QueryResult {
+        let mut names = self.tables.keys().cloned().collect::<Vec<_>>();
+        names.sort();
+        QueryResult {
+            columns: vec!["table_name".to_string()],
+            rows: names
+                .into_iter()
+                .map(|name| vec![Value::String(name)])
+                .collect(),
+        }
+    }
+
+    fn describe_table_inner(&self, table_name: &str) -> Result<QueryResult> {
+        let table = self
+            .tables
+            .get(table_name)
+            .with_context(|| format!("unknown table {table_name}"))?;
+
+        let rows = table
+            .schema
+            .columns
+            .iter()
+            .map(|column| {
+                vec![
+                    Value::String(column.name.clone()),
+                    Value::String(data_type_to_sql_name(column.data_type).to_string()),
+                ]
+            })
+            .collect();
+
+        Ok(QueryResult {
+            columns: vec!["column_name".to_string(), "data_type".to_string()],
+            rows,
+        })
+    }
+
     /// Execute commands that include writes (INSERT, CREATE TABLE).
     /// Flushes before SELECTs for consistency.
     fn execute_commands(&mut self, commands: Vec<Command>) -> Result<Vec<QueryResult>> {
@@ -370,6 +506,20 @@ impl DbInner {
                         self.create_table_inner(schema)?;
                     }
                     results.push(QueryResult::empty());
+                }
+                Command::AlterTable(plan) => {
+                    self.alter_table_inner(plan)?;
+                    results.push(QueryResult::empty());
+                }
+                Command::DropTable(plan) => {
+                    self.drop_table_inner(&plan.table_name, plan.if_exists)?;
+                    results.push(QueryResult::empty());
+                }
+                Command::ShowTables => {
+                    results.push(self.show_tables_inner());
+                }
+                Command::DescribeTable(table_name) => {
+                    results.push(self.describe_table_inner(&table_name)?);
                 }
                 Command::Insert(plan) => {
                     self.insert_rows_inner(&plan.table_name, plan.rows)?;
@@ -400,6 +550,12 @@ impl DbInner {
                 }
                 Command::Eval(plan) => {
                     results.push(execute_eval(plan)?);
+                }
+                Command::ShowTables => {
+                    results.push(self.show_tables_inner());
+                }
+                Command::DescribeTable(table_name) => {
+                    results.push(self.describe_table_inner(&table_name)?);
                 }
                 _ => bail!("unexpected write command in read path"),
             }
@@ -724,12 +880,16 @@ fn eval_arithmetic(left: Value, op: ArithmeticOp, right: Value) -> Result<Value>
             };
             Ok(Value::Float64(OrderedFloat(result)))
         }
-        (Value::Int64(l), Value::Float64(r)) => {
-            eval_arithmetic(Value::Float64(OrderedFloat(l as f64)), op, Value::Float64(r))
-        }
-        (Value::Float64(l), Value::Int64(r)) => {
-            eval_arithmetic(Value::Float64(l), op, Value::Float64(OrderedFloat(r as f64)))
-        }
+        (Value::Int64(l), Value::Float64(r)) => eval_arithmetic(
+            Value::Float64(OrderedFloat(l as f64)),
+            op,
+            Value::Float64(r),
+        ),
+        (Value::Float64(l), Value::Int64(r)) => eval_arithmetic(
+            Value::Float64(l),
+            op,
+            Value::Float64(OrderedFloat(r as f64)),
+        ),
         (l, r) => bail!("unsupported arithmetic between {l:?} and {r:?}"),
     }
 }
@@ -740,6 +900,16 @@ fn compare_result_rows(lhs: &[Value], rhs: &[Value], index: usize, descending: b
         ordering.reverse()
     } else {
         ordering
+    }
+}
+
+fn data_type_to_sql_name(data_type: DataType) -> &'static str {
+    match data_type {
+        DataType::Int64 => "INT",
+        DataType::Float64 => "REAL",
+        DataType::Bool => "BOOL",
+        DataType::String => "TEXT",
+        DataType::Timestamp => "TIMESTAMP",
     }
 }
 
@@ -852,9 +1022,8 @@ mod tests {
         assert_eq!(result.rows[2][0], Value::Float64(OrderedFloat(75.0)));
 
         // Expression with filter
-        let results = db.execute_sql(
-            "SELECT name, price + 1.5 AS adjusted FROM products WHERE quantity > 4",
-        )?;
+        let results = db
+            .execute_sql("SELECT name, price + 1.5 AS adjusted FROM products WHERE quantity > 4")?;
         let result = results.last().unwrap();
         assert_eq!(result.rows.len(), 2);
 
@@ -915,6 +1084,132 @@ mod tests {
         // Should still error without IF NOT EXISTS
         let err = db.execute_sql("CREATE TABLE logs (ts TIMESTAMP, level TEXT);");
         assert!(err.is_err());
+
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn alters_table_and_column_names() -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "narrowdb-test-alter-{}.db",
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        ));
+
+        {
+            let db = NarrowDb::open(&path, DbOptions::default())?;
+            db.execute_sql(
+                "CREATE TABLE logs (ts TIMESTAMP, level TEXT);
+                 INSERT INTO logs VALUES (1, 'info'), (2, 'error');",
+            )?;
+
+            db.execute_sql("ALTER TABLE logs RENAME TO events;")?;
+            db.execute_sql("ALTER TABLE events RENAME COLUMN level TO severity;")?;
+
+            let old_table = db.execute_sql("SELECT * FROM logs;");
+            assert!(old_table.is_err());
+
+            let results = db.execute_sql(
+                "SELECT severity FROM events WHERE severity = 'error' ORDER BY severity;",
+            )?;
+            let result = results.last().unwrap();
+            assert_eq!(result.columns, vec!["severity"]);
+            assert_eq!(result.rows.len(), 1);
+            assert_eq!(result.rows[0][0], Value::String("error".to_string()));
+        }
+
+        let reopened = NarrowDb::open(&path, DbOptions::default())?;
+        let results = reopened.execute_sql("SELECT severity FROM events ORDER BY severity;")?;
+        let result = results.last().unwrap();
+        assert_eq!(result.columns, vec!["severity"]);
+        assert_eq!(result.rows.len(), 2);
+
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn drops_tables() -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "narrowdb-test-drop-{}.db",
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        ));
+
+        {
+            let db = NarrowDb::open(&path, DbOptions::default())?;
+            db.execute_sql("CREATE TABLE logs (ts TIMESTAMP, level TEXT);")?;
+            db.execute_sql("DROP TABLE logs;")?;
+
+            let select_missing = db.execute_sql("SELECT * FROM logs;");
+            assert!(select_missing.is_err());
+
+            db.execute_sql("DROP TABLE IF EXISTS logs;")?;
+        }
+
+        let reopened = NarrowDb::open(&path, DbOptions::default())?;
+        reopened.execute_sql("CREATE TABLE logs (ts TIMESTAMP, level TEXT);")?;
+
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn show_tables_lists_tables() -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "narrowdb-test-show-{}.db",
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        ));
+
+        let db = NarrowDb::open(&path, DbOptions::default())?;
+        db.execute_sql("CREATE TABLE logs (ts TIMESTAMP, level TEXT);")?;
+        db.execute_sql("CREATE TABLE metrics (ts TIMESTAMP, value REAL);")?;
+
+        let results = db.execute_sql("SHOW TABLES;")?;
+        let result = results.last().unwrap();
+        assert_eq!(result.columns, vec!["table_name"]);
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[0][0], Value::String("logs".to_string()));
+        assert_eq!(result.rows[1][0], Value::String("metrics".to_string()));
+
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn describe_table_returns_schema() -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "narrowdb-test-describe-{}.db",
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        ));
+
+        let db = NarrowDb::open(&path, DbOptions::default())?;
+        db.execute_sql("CREATE TABLE logs (ts TIMESTAMP, level TEXT, status INT);")?;
+
+        let results = db.execute_sql("DESCRIBE logs;")?;
+        let result = results.last().unwrap();
+        assert_eq!(result.columns, vec!["column_name", "data_type"]);
+        assert_eq!(result.rows.len(), 3);
+        assert_eq!(
+            result.rows[0],
+            vec![
+                Value::String("ts".to_string()),
+                Value::String("TIMESTAMP".to_string())
+            ]
+        );
+        assert_eq!(
+            result.rows[1],
+            vec![
+                Value::String("level".to_string()),
+                Value::String("TEXT".to_string())
+            ]
+        );
+        assert_eq!(
+            result.rows[2],
+            vec![
+                Value::String("status".to_string()),
+                Value::String("INT".to_string())
+            ]
+        );
 
         std::fs::remove_file(path)?;
         Ok(())

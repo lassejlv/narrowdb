@@ -94,7 +94,10 @@ impl ServerConfig {
             match args[index].as_str() {
                 "--listen" => {
                     index += 1;
-                    listen_addr = args.get(index).context("missing value for --listen")?.clone();
+                    listen_addr = args
+                        .get(index)
+                        .context("missing value for --listen")?
+                        .clone();
                 }
                 "--row-group-size" => {
                     index += 1;
@@ -117,7 +120,10 @@ impl ServerConfig {
                 }
                 "--password" => {
                     index += 1;
-                    password = args.get(index).context("missing value for --password")?.clone();
+                    password = args
+                        .get(index)
+                        .context("missing value for --password")?
+                        .clone();
                 }
                 other => bail!("unknown argument: {other}"),
             }
@@ -261,8 +267,8 @@ impl ExtendedQueryHandler for NarrowDbBackend {
             ));
         }
 
-        let mut responses =
-            self.execute_sql_with_format(&portal.statement.statement, &portal.result_column_format)?;
+        let mut responses = self
+            .execute_sql_with_format(&portal.statement.statement, &portal.result_column_format)?;
         if responses.len() != 1 {
             return Err(unsupported_error(
                 "extended query protocol only supports a single statement at a time",
@@ -296,7 +302,8 @@ impl ExtendedQueryHandler for NarrowDbBackend {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let fields = self.describe_fields(&portal.statement.statement, &portal.result_column_format)?;
+        let fields =
+            self.describe_fields(&portal.statement.statement, &portal.result_column_format)?;
         Ok(DescribePortalResponse::new(fields))
     }
 }
@@ -388,7 +395,15 @@ impl NarrowDbBackend {
         if result.columns.is_empty() {
             let tag = match command {
                 Statement::CreateTable(_) => Tag::new("CREATE TABLE"),
-                Statement::Insert(insert) => Tag::new("INSERT").with_rows(insert_values_len(insert)),
+                Statement::AlterTable { .. } => Tag::new("ALTER TABLE"),
+                Statement::Drop { object_type, .. }
+                    if *object_type == sqlparser::ast::ObjectType::Table =>
+                {
+                    Tag::new("DROP TABLE")
+                }
+                Statement::Insert(insert) => {
+                    Tag::new("INSERT").with_rows(insert_values_len(insert))
+                }
                 Statement::Query(_) => Tag::new("SELECT"),
                 _ => Tag::new(statement_tag(command)),
             };
@@ -445,6 +460,12 @@ fn insert_values_len(insert: &sqlparser::ast::Insert) -> usize {
 fn statement_tag(statement: &Statement) -> &'static str {
     match statement {
         Statement::CreateTable(_) => "CREATE TABLE",
+        Statement::AlterTable { .. } => "ALTER TABLE",
+        Statement::Drop { object_type, .. }
+            if *object_type == sqlparser::ast::ObjectType::Table =>
+        {
+            "DROP TABLE"
+        }
         Statement::Insert(_) => "INSERT",
         Statement::Query(_) => "SELECT",
         _ => "OK",
@@ -580,7 +601,9 @@ mod tests {
         let (client, connection) = tokio_postgres::connect(
             &format!(
                 "host=127.0.0.1 port={} user={} password={} dbname=testdb",
-                addr.port(), config.user, config.password
+                addr.port(),
+                config.user,
+                config.password
             ),
             NoTls,
         )
@@ -596,7 +619,9 @@ mod tests {
             )
             .await?;
 
-        let rows = client.query("SELECT ts, service, status FROM logs", &[]).await?;
+        let rows = client
+            .query("SELECT ts, service, status FROM logs", &[])
+            .await?;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get::<_, i64>(0), 1);
         assert_eq!(rows[0].get::<_, String>(1), "api");

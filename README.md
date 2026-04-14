@@ -13,6 +13,14 @@ narrowdb exec logs.db "INSERT INTO logs VALUES (1, 'info', 'api', 200, 12.0), (2
 
 # Query with filters, aggregation, and ordering
 narrowdb exec logs.db "SELECT service, COUNT(*) AS errors FROM logs WHERE level = 'error' GROUP BY service ORDER BY errors DESC LIMIT 5;"
+
+# Rename and drop tables
+narrowdb exec logs.db "ALTER TABLE logs RENAME TO app_logs;"
+narrowdb exec logs.db "DROP TABLE IF EXISTS old_logs;"
+
+# Inspect metadata
+narrowdb exec logs.db "SHOW TABLES;"
+narrowdb exec logs.db "DESCRIBE app_logs;"
 ```
 
 ## As a library

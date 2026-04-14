@@ -3,7 +3,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{Context, Result, bail, ensure};
 use lz4_flex::block;
 use memmap2::{Mmap, MmapOptions};
 use once_cell::sync::OnceCell;
@@ -430,6 +430,23 @@ impl StoredRowGroup {
             nulls,
         })
     }
+
+    pub fn materialize(&self, schema: &Schema, mapped: Option<&[u8]>) -> Result<RowGroup> {
+        if let Some(row_group) = &self.in_memory {
+            return Ok(row_group.clone());
+        }
+
+        let required_columns = (0..schema.columns.len()).collect::<Vec<_>>();
+        let loaded = self.load(schema, mapped, &required_columns)?;
+        let mut columns = Vec::with_capacity(required_columns.len());
+        let mut nulls = Vec::with_capacity(required_columns.len());
+        for index in required_columns {
+            columns.push(loaded.column(index).clone());
+            nulls.push(loaded.nulls(index).cloned());
+        }
+
+        Ok(RowGroup::new(columns, nulls))
+    }
 }
 
 impl StoredColumnSource {
@@ -771,6 +788,57 @@ impl Storage {
 
     pub fn remap(&mut self) -> Result<()> {
         self.mmap = Some(unsafe { MmapOptions::new().map(&self.file)? });
+        Ok(())
+    }
+
+    pub fn rewrite_with_tables(&mut self, tables: &mut FxHashMap<String, Table>) -> Result<()> {
+        let mapped = self.mapped_bytes();
+        let mut table_names = tables.keys().cloned().collect::<Vec<_>>();
+        table_names.sort();
+
+        let mut materialized = Vec::with_capacity(table_names.len());
+        for table_name in &table_names {
+            let table = tables
+                .get_mut(table_name)
+                .with_context(|| format!("missing table {table_name} during rewrite"))?;
+            ensure!(
+                table.pending.rows() == 0,
+                "cannot rewrite with pending rows in table {}",
+                table.schema.table_name
+            );
+
+            let row_groups = table
+                .row_groups
+                .iter()
+                .map(|row_group| row_group.materialize(&table.schema, mapped))
+                .collect::<Result<Vec<_>>>()?;
+
+            table.row_groups = row_groups
+                .iter()
+                .cloned()
+                .map(StoredRowGroup::from_row_group)
+                .collect();
+
+            materialized.push((table.schema.clone(), row_groups));
+        }
+
+        self.mmap = None;
+        self.file.set_len(0)?;
+        self.file.seek(SeekFrom::Start(0))?;
+        self.file.write_all(MAGIC)?;
+        if self.options.sync_on_flush {
+            self.file.sync_data()?;
+        }
+
+        for (schema, row_groups) in &materialized {
+            self.append_create_table(schema)?;
+            for row_group in row_groups {
+                self.append_row_group(&schema.table_name, row_group, schema)?;
+            }
+        }
+
+        self.remap()?;
+        self.file.seek(SeekFrom::End(0))?;
         Ok(())
     }
 

@@ -1,8 +1,9 @@
 use anyhow::{Result, anyhow, bail, ensure};
 use ordered_float::OrderedFloat;
 use sqlparser::ast::{
-    BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, OrderByExpr,
-    Query, Select, SelectItem, SetExpr, Statement, TableFactor, Value as SqlValue,
+    AlterTableOperation, BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments,
+    Ident, ObjectName, ObjectType, OrderByExpr, Query, Select, SelectItem, SetExpr,
+    ShowStatementOptions, Statement, TableFactor, Value as SqlValue,
 };
 use sqlparser::dialect::SQLiteDialect;
 use sqlparser::parser::Parser;
@@ -13,9 +14,37 @@ use crate::types::{DataType, Schema, Value};
 pub enum Command {
     CreateTable(Schema),
     CreateTableIfNotExists(Schema),
+    AlterTable(AlterTablePlan),
+    DropTable(DropTablePlan),
+    ShowTables,
+    DescribeTable(String),
     Insert(InsertPlan),
     Select(SelectPlan),
     Eval(EvalPlan),
+}
+
+#[derive(Debug)]
+pub struct AlterTablePlan {
+    pub table_name: String,
+    pub if_exists: bool,
+    pub operation: AlterTableOperationPlan,
+}
+
+#[derive(Debug)]
+pub enum AlterTableOperationPlan {
+    RenameTable {
+        new_table_name: String,
+    },
+    RenameColumn {
+        old_column_name: String,
+        new_column_name: String,
+    },
+}
+
+#[derive(Debug)]
+pub struct DropTablePlan {
+    pub table_name: String,
+    pub if_exists: bool,
 }
 
 #[derive(Debug)]
@@ -119,10 +148,118 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Command>> {
 fn parse_statement(statement: Statement) -> Result<Command> {
     match statement {
         Statement::CreateTable(create) => parse_create_table(create),
+        Statement::AlterTable {
+            name,
+            if_exists,
+            operations,
+            ..
+        } => parse_alter_table(name, if_exists, operations),
+        Statement::Drop {
+            object_type,
+            if_exists,
+            names,
+            ..
+        } => parse_drop(object_type, if_exists, names),
+        Statement::ShowTables {
+            terse,
+            history,
+            extended,
+            full,
+            external,
+            show_options,
+        } => parse_show_tables(terse, history, extended, full, external, show_options),
+        Statement::ExplainTable { table_name, .. } => Ok(Command::DescribeTable(
+            object_name_to_string(&table_name.0)?,
+        )),
         Statement::Insert(insert) => parse_insert(insert),
         Statement::Query(query) => parse_query(*query),
         other => bail!("unsupported statement: {other}"),
     }
+}
+
+fn parse_show_tables(
+    terse: bool,
+    history: bool,
+    extended: bool,
+    full: bool,
+    external: bool,
+    show_options: ShowStatementOptions,
+) -> Result<Command> {
+    ensure!(
+        !terse && !history && !extended && !full && !external,
+        "SHOW TABLES options are not supported yet"
+    );
+    ensure!(
+        show_options.show_in.is_none(),
+        "SHOW TABLES IN is not supported yet"
+    );
+    ensure!(
+        show_options.starts_with.is_none(),
+        "SHOW TABLES STARTS WITH is not supported yet"
+    );
+    ensure!(
+        show_options.limit.is_none(),
+        "SHOW TABLES LIMIT is not supported yet"
+    );
+    ensure!(
+        show_options.limit_from.is_none(),
+        "SHOW TABLES LIMIT ... FROM is not supported yet"
+    );
+    ensure!(
+        show_options.filter_position.is_none(),
+        "SHOW TABLES LIKE/WHERE is not supported yet"
+    );
+    Ok(Command::ShowTables)
+}
+
+fn parse_alter_table(
+    name: ObjectName,
+    if_exists: bool,
+    operations: Vec<AlterTableOperation>,
+) -> Result<Command> {
+    ensure!(
+        operations.len() == 1,
+        "ALTER TABLE supports exactly one operation"
+    );
+
+    let table_name = object_name_to_string(&name.0)?;
+    let operation = match operations.into_iter().next().unwrap() {
+        AlterTableOperation::RenameTable { table_name } => AlterTableOperationPlan::RenameTable {
+            new_table_name: object_name_to_string(&table_name.0)?,
+        },
+        AlterTableOperation::RenameColumn {
+            old_column_name,
+            new_column_name,
+        } => AlterTableOperationPlan::RenameColumn {
+            old_column_name: old_column_name.value,
+            new_column_name: new_column_name.value,
+        },
+        other => {
+            bail!("unsupported ALTER TABLE operation: {other}. Supported: RENAME TO, RENAME COLUMN")
+        }
+    };
+
+    Ok(Command::AlterTable(AlterTablePlan {
+        table_name,
+        if_exists,
+        operation,
+    }))
+}
+
+fn parse_drop(object_type: ObjectType, if_exists: bool, names: Vec<ObjectName>) -> Result<Command> {
+    ensure!(
+        object_type == ObjectType::Table,
+        "only DROP TABLE is supported"
+    );
+    ensure!(
+        names.len() == 1,
+        "DROP TABLE supports exactly one table at a time"
+    );
+
+    Ok(Command::DropTable(DropTablePlan {
+        table_name: object_name_to_string(&names[0].0)?,
+        if_exists,
+    }))
 }
 
 fn parse_create_table(statement: sqlparser::ast::CreateTable) -> Result<Command> {
@@ -474,9 +611,9 @@ fn parse_eval(select: Select) -> Result<Command> {
 fn parse_scalar_expr(expr: Expr) -> Result<ScalarExpr> {
     match expr {
         Expr::Identifier(ident) => Ok(ScalarExpr::ColumnRef(ident.value)),
-        Expr::CompoundIdentifier(parts) => {
-            Ok(ScalarExpr::ColumnRef(compound_identifier_to_string(&parts)?))
-        }
+        Expr::CompoundIdentifier(parts) => Ok(ScalarExpr::ColumnRef(
+            compound_identifier_to_string(&parts)?,
+        )),
         Expr::Value(value) => Ok(ScalarExpr::Literal(parse_sql_value(value)?)),
         Expr::BinaryOp { left, op, right } => {
             let arith_op = match op {
