@@ -54,19 +54,24 @@ fn main() -> Result<()> {
     for (label, sql) in common::QUERIES {
         let (result, elapsed) = common::timed(|| -> Result<common::QueryResult> {
             let mut stmt = conn.prepare(sql)?;
-            let rows: Vec<Vec<String>> = stmt.query_map([], |row| {
-                let mut vals = Vec::new();
-                for i in 0..10 {
-                    match row.get::<_, duckdb::types::Value>(i) {
-                        Ok(v) => vals.push(duckdb_value_to_string(&v)),
-                        Err(_) => break,
+            let rows: Vec<Vec<String>> = stmt
+                .query_map([], |row| {
+                    let mut vals = Vec::new();
+                    for i in 0..10 {
+                        match row.get::<_, duckdb::types::Value>(i) {
+                            Ok(v) => vals.push(duckdb_value_to_string(&v)),
+                            Err(_) => break,
+                        }
                     }
-                }
-                Ok(vals)
-            })?.collect::<std::result::Result<Vec<_>, _>>()?;
+                    Ok(vals)
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
             let col_count = stmt.column_count();
             let columns = (0..col_count)
-                .map(|i| stmt.column_name(i).map_or("?".to_string(), |v| v.to_string()))
+                .map(|i| {
+                    stmt.column_name(i)
+                        .map_or("?".to_string(), |v| v.to_string())
+                })
                 .collect();
             Ok(common::QueryResult { columns, rows })
         });

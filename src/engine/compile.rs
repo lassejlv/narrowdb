@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
 use ordered_float::OrderedFloat;
 
-use crate::sql::{AggregateKind, ArithmeticOp, CompareOp, Filter, Projection, ProjectionExpr, ScalarExpr};
+use crate::sql::{
+    AggregateKind, ArithmeticOp, CompareOp, Filter, Projection, ProjectionExpr, ScalarExpr,
+};
 use crate::storage::ColumnData;
 use crate::types::{Schema, Value};
 

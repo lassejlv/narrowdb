@@ -75,14 +75,20 @@ where
             .row_groups
             .par_iter()
             .filter(|rg| row_group_matches(rg.rows(), rg.stats(), filters))
-            .map(|rg| rg.load(&table.schema, mapped, required_columns).and_then(|l| worker(&l)))
+            .map(|rg| {
+                rg.load(&table.schema, mapped, required_columns)
+                    .and_then(|l| worker(&l))
+            })
             .collect::<Vec<_>>()
     } else {
         table
             .row_groups
             .iter()
             .filter(|rg| row_group_matches(rg.rows(), rg.stats(), filters))
-            .map(|rg| rg.load(&table.schema, mapped, required_columns).and_then(|l| worker(&l)))
+            .map(|rg| {
+                rg.load(&table.schema, mapped, required_columns)
+                    .and_then(|l| worker(&l))
+            })
             .collect::<Vec<_>>()
     };
     partials.into_iter().collect()
@@ -119,11 +125,13 @@ pub(super) fn aggregate_row_group_grouped(
 
     // Fast path: single StringDict GROUP BY column — use array-indexed aggregation.
     if group_indexes.len() == 1 {
-        if let ColumnData::StringDict { dictionary, codes } =
-            row_group.column(group_indexes[0])
-        {
+        if let ColumnData::StringDict { dictionary, codes } = row_group.column(group_indexes[0]) {
             return aggregate_single_stringdict(
-                row_group, &selection, projections, dictionary, codes,
+                row_group,
+                &selection,
+                projections,
+                dictionary,
+                codes,
             );
         }
     }
@@ -202,8 +210,11 @@ fn row_group_matches(rows: usize, stats: &[ColumnStats], filters: &[CompiledFilt
 fn stats_may_match_eq(stats: &ColumnStats, value: &Value) -> bool {
     match (&stats.min, &stats.max) {
         (Some(min), Some(max)) => {
-            min.compare(value).is_none_or(|o| o != std::cmp::Ordering::Greater)
-                && max.compare(value).is_none_or(|o| o != std::cmp::Ordering::Less)
+            min.compare(value)
+                .is_none_or(|o| o != std::cmp::Ordering::Greater)
+                && max
+                    .compare(value)
+                    .is_none_or(|o| o != std::cmp::Ordering::Less)
         }
         _ => true,
     }
@@ -211,28 +222,36 @@ fn stats_may_match_eq(stats: &ColumnStats, value: &Value) -> bool {
 
 fn stats_may_match_lt(stats: &ColumnStats, value: &Value) -> bool {
     match &stats.min {
-        Some(min) => min.compare(value).is_none_or(|o| o == std::cmp::Ordering::Less),
+        Some(min) => min
+            .compare(value)
+            .is_none_or(|o| o == std::cmp::Ordering::Less),
         None => true,
     }
 }
 
 fn stats_may_match_lte(stats: &ColumnStats, value: &Value) -> bool {
     match &stats.min {
-        Some(min) => min.compare(value).is_none_or(|o| o != std::cmp::Ordering::Greater),
+        Some(min) => min
+            .compare(value)
+            .is_none_or(|o| o != std::cmp::Ordering::Greater),
         None => true,
     }
 }
 
 fn stats_may_match_gt(stats: &ColumnStats, value: &Value) -> bool {
     match &stats.max {
-        Some(max) => max.compare(value).is_none_or(|o| o == std::cmp::Ordering::Greater),
+        Some(max) => max
+            .compare(value)
+            .is_none_or(|o| o == std::cmp::Ordering::Greater),
         None => true,
     }
 }
 
 fn stats_may_match_gte(stats: &ColumnStats, value: &Value) -> bool {
     match &stats.max {
-        Some(max) => max.compare(value).is_none_or(|o| o != std::cmp::Ordering::Less),
+        Some(max) => max
+            .compare(value)
+            .is_none_or(|o| o != std::cmp::Ordering::Less),
         None => true,
     }
 }
@@ -241,7 +260,10 @@ fn stats_may_match_gte(stats: &ColumnStats, value: &Value) -> bool {
 // Vectorized filter evaluation — produces SelectionBitmap
 // ---------------------------------------------------------------------------
 
-fn select_rows_bitmap(row_group: &LoadedRowGroup<'_>, filters: &[CompiledFilter]) -> SelectionBitmap {
+fn select_rows_bitmap(
+    row_group: &LoadedRowGroup<'_>,
+    filters: &[CompiledFilter],
+) -> SelectionBitmap {
     if !row_group_matches(row_group.rows, row_group.stats, filters) {
         return SelectionBitmap::none(row_group.rows);
     }
@@ -259,7 +281,10 @@ fn select_rows_bitmap(row_group: &LoadedRowGroup<'_>, filters: &[CompiledFilter]
     bitmap
 }
 
-fn evaluate_filter_bitmap(row_group: &LoadedRowGroup<'_>, filter: &CompiledFilter) -> SelectionBitmap {
+fn evaluate_filter_bitmap(
+    row_group: &LoadedRowGroup<'_>,
+    filter: &CompiledFilter,
+) -> SelectionBitmap {
     let nulls = row_group.nulls(filter.column_index);
 
     // Handle IS NULL / IS NOT NULL directly from null bitmap.
@@ -304,21 +329,20 @@ fn evaluate_column_filter(
     rows: usize,
 ) -> SelectionBitmap {
     match (column, value) {
-        (ColumnData::Int64(values), Value::Int64(target)) => {
-            eval_int64(values, *target, op, rows)
-        }
+        (ColumnData::Int64(values), Value::Int64(target)) => eval_int64(values, *target, op, rows),
         (ColumnData::Int64(values), Value::Float64(target)) => {
             eval_int64_vs_float(values, target.into_inner(), op, rows)
         }
         (ColumnData::Float64(values), Value::Float64(target)) => {
             eval_float64(values, *target, op, rows)
         }
-        (ColumnData::Float64(values), Value::Int64(target)) => {
-            eval_float64(values, ordered_float::OrderedFloat(*target as f64), op, rows)
-        }
-        (ColumnData::Bool(values), Value::Bool(target)) => {
-            eval_bool(values, *target, op, rows)
-        }
+        (ColumnData::Float64(values), Value::Int64(target)) => eval_float64(
+            values,
+            ordered_float::OrderedFloat(*target as f64),
+            op,
+            rows,
+        ),
+        (ColumnData::Bool(values), Value::Bool(target)) => eval_bool(values, *target, op, rows),
         (ColumnData::StringDict { dictionary, codes }, Value::String(target)) => {
             eval_string_dict(dictionary, codes, target, op, rows)
         }
@@ -368,15 +392,16 @@ fn eval_float64(
     op: CompareOp,
     rows: usize,
 ) -> SelectionBitmap {
-    let pred: fn(ordered_float::OrderedFloat<f64>, ordered_float::OrderedFloat<f64>) -> bool = match op {
-        CompareOp::Eq => |a, b| a == b,
-        CompareOp::NotEq => |a, b| a != b,
-        CompareOp::Lt => |a, b| a < b,
-        CompareOp::Lte => |a, b| a <= b,
-        CompareOp::Gt => |a, b| a > b,
-        CompareOp::Gte => |a, b| a >= b,
-        _ => unreachable!(),
-    };
+    let pred: fn(ordered_float::OrderedFloat<f64>, ordered_float::OrderedFloat<f64>) -> bool =
+        match op {
+            CompareOp::Eq => |a, b| a == b,
+            CompareOp::NotEq => |a, b| a != b,
+            CompareOp::Lt => |a, b| a < b,
+            CompareOp::Lte => |a, b| a <= b,
+            CompareOp::Gt => |a, b| a > b,
+            CompareOp::Gte => |a, b| a >= b,
+            _ => unreachable!(),
+        };
     build_bitmap_from_predicate(rows, |i| pred(values[i], target))
 }
 
@@ -406,15 +431,13 @@ fn eval_string_dict(
                 None => SelectionBitmap::none(rows),
             }
         }
-        CompareOp::NotEq => {
-            match dictionary.iter().position(|s| s == target) {
-                Some(code) => {
-                    let code = code as u32;
-                    build_bitmap_from_predicate(rows, |i| codes[i] != code)
-                }
-                None => SelectionBitmap::all(rows),
+        CompareOp::NotEq => match dictionary.iter().position(|s| s == target) {
+            Some(code) => {
+                let code = code as u32;
+                build_bitmap_from_predicate(rows, |i| codes[i] != code)
             }
-        }
+            None => SelectionBitmap::all(rows),
+        },
         _ => {
             // Range comparisons: build a lookup table for matching codes.
             let pred: fn(&str, &str) -> bool = match op {
@@ -430,7 +453,12 @@ fn eval_string_dict(
     }
 }
 
-fn eval_string_plain(values: &[String], target: &str, op: CompareOp, rows: usize) -> SelectionBitmap {
+fn eval_string_plain(
+    values: &[String],
+    target: &str,
+    op: CompareOp,
+    rows: usize,
+) -> SelectionBitmap {
     let pred: fn(&str, &str) -> bool = match op {
         CompareOp::Eq => |a, b| a == b,
         CompareOp::NotEq => |a, b| a != b,

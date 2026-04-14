@@ -113,7 +113,11 @@ pub fn print_query(label: &str, elapsed: Duration, result: &QueryResult) {
     if !result.columns.is_empty() {
         println!("  {}", result.columns.join(" | "));
         for row in result.rows.iter().take(5) {
-            let line = row.iter().map(ToString::to_string).collect::<Vec<_>>().join(" | ");
+            let line = row
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(" | ");
             println!("  {line}");
         }
     }

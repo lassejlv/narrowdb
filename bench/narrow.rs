@@ -86,7 +86,11 @@ fn main() -> Result<()> {
         let last = result.last().unwrap();
         let qr = common::QueryResult {
             columns: last.columns.clone(),
-            rows: last.rows.iter().map(|row| row.iter().map(ToString::to_string).collect()).collect(),
+            rows: last
+                .rows
+                .iter()
+                .map(|row| row.iter().map(ToString::to_string).collect())
+                .collect(),
         };
         common::print_query(label, elapsed, &qr);
     }
