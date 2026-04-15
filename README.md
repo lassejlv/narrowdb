@@ -66,15 +66,22 @@ SELECT * FROM logs;
 
 ## Benchmarks
 
-10M rows, 9 columns, Apple Silicon, release build (`cargo run --release --bin bench-narrow -- 10000000 --query-threads 8`):
+1M rows, 9 columns, Apple Silicon, release build:
+
+```bash
+cargo run --release --features bench-duckdb --bin bench-compare -- 1000000 --query-threads 8
+```
 
 | Metric | NarrowDB | DuckDB | Delta |
 |--------|----------|--------|-------|
-| Ingest throughput | 7.2M rows/s | 1.4M rows/s | **5x faster** |
-| Storage size | 59.6 MiB (6.3 B/row) | 90.3 MiB (9.5 B/row) | **34% smaller** |
-| Filter + GROUP BY | 3.3ms | 5.9ms | **1.8x faster** |
-| Filter + GROUP BY + AVG | 4.1ms | 5.1ms | **1.2x faster** |
-| Filter + COUNT | 3.7ms | 6.5ms | **1.8x faster** |
+| Ingest throughput | 6.61M rows/s | 1.81M rows/s | **3.65x higher** |
+| Storage size | 5.97 MiB (6.26 B/row) | 9.01 MiB (9.45 B/row) | **1.51x smaller** |
+| Filter + GROUP BY | 536µs | 2.17ms | **4.05x faster** |
+| Filter + GROUP BY + AVG | 475µs | 1.39ms | **2.93x faster** |
+| Filter + COUNT | 553µs | 912µs | **1.65x faster** |
+| Projection-heavy scan | 1.59ms | 1.42ms | DuckDB **1.12x faster** |
+| High-cardinality grouped count | 1.32ms | 1.19ms | DuckDB **1.11x faster** |
+| Cross-row-group string group by | 1.13ms | 2.04ms | **1.80x faster** |
 
 ## License
 
