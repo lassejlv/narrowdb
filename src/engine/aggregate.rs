@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail, ensure};
 use ordered_float::OrderedFloat;
 
 use crate::sql::AggregateKind;
-use crate::storage::LoadedRowGroup;
+use crate::storage::{ColumnData, LoadedRowGroup};
 use crate::types::Value;
 
 use super::compile::{CompiledProjection, CompiledProjectionExpr};
@@ -61,9 +61,13 @@ impl AggState {
                     column_index: Some(index),
                 },
             ) => {
-                *sum += row_group
-                    .column(*index)
-                    .numeric_at(row)
+                if row_group
+                    .nulls(*index)
+                    .is_some_and(|nulls| nulls.is_null(row))
+                {
+                    return Ok(());
+                }
+                *sum += numeric_value(row_group.column(*index), row)
                     .context("SUM expects a numeric column")?;
                 Ok(())
             }
@@ -74,12 +78,18 @@ impl AggState {
                     column_index: Some(index),
                 },
             ) => {
-                let value = row_group.column(*index).value_at(row);
+                if row_group
+                    .nulls(*index)
+                    .is_some_and(|nulls| nulls.is_null(row))
+                {
+                    return Ok(());
+                }
+                let column = row_group.column(*index);
                 if current
                     .as_ref()
-                    .is_none_or(|existing| value.compare(existing) == Some(Ordering::Less))
+                    .is_none_or(|existing| column.compare_at(row, existing) == Some(Ordering::Less))
                 {
-                    *current = Some(value);
+                    *current = Some(column.value_at(row));
                 }
                 Ok(())
             }
@@ -90,12 +100,17 @@ impl AggState {
                     column_index: Some(index),
                 },
             ) => {
-                let value = row_group.column(*index).value_at(row);
-                if current
-                    .as_ref()
-                    .is_none_or(|existing| value.compare(existing) == Some(Ordering::Greater))
+                if row_group
+                    .nulls(*index)
+                    .is_some_and(|nulls| nulls.is_null(row))
                 {
-                    *current = Some(value);
+                    return Ok(());
+                }
+                let column = row_group.column(*index);
+                if current.as_ref().is_none_or(|existing| {
+                    column.compare_at(row, existing) == Some(Ordering::Greater)
+                }) {
+                    *current = Some(column.value_at(row));
                 }
                 Ok(())
             }
@@ -106,9 +121,13 @@ impl AggState {
                     column_index: Some(index),
                 },
             ) => {
-                *sum += row_group
-                    .column(*index)
-                    .numeric_at(row)
+                if row_group
+                    .nulls(*index)
+                    .is_some_and(|nulls| nulls.is_null(row))
+                {
+                    return Ok(());
+                }
+                *sum += numeric_value(row_group.column(*index), row)
                     .context("AVG expects a numeric column")?;
                 *count += 1;
                 Ok(())
@@ -180,5 +199,13 @@ impl AggState {
                 Ok(Value::Float64(OrderedFloat(sum / count as f64)))
             }
         }
+    }
+}
+
+fn numeric_value(column: &ColumnData, row: usize) -> Option<f64> {
+    match column {
+        ColumnData::Int64(values) => Some(values[row] as f64),
+        ColumnData::Float64(values) => Some(values[row].into_inner()),
+        _ => None,
     }
 }

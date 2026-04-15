@@ -48,6 +48,7 @@ impl SelectionBitmap {
         self.len
     }
 
+    #[cfg(test)]
     /// Intersect in-place: self &= other.
     pub fn intersect(&mut self, other: &SelectionBitmap) {
         debug_assert_eq!(self.len, other.len);
@@ -57,52 +58,66 @@ impl SelectionBitmap {
         self.recount();
     }
 
+    pub fn clear(&mut self) {
+        self.words.fill(0);
+        self.count = 0;
+    }
+
     /// Clear bits where the null bitmap indicates null (bit clear in NullBitmap = null).
     /// After this, only non-null selected rows remain.
     pub fn mask_non_null(&mut self, nulls: &NullBitmap) {
-        let null_bytes = nulls.data();
-        // NullBitmap uses u8 words (set = present, clear = null).
-        // We need to AND our u64 words with the corresponding 8 bytes from NullBitmap.
-        for (word_idx, word) in self.words.iter_mut().enumerate() {
-            let byte_offset = word_idx * 8;
-            let mut mask: u64 = 0;
-            for b in 0..8 {
-                let idx = byte_offset + b;
-                if idx < null_bytes.len() {
-                    mask |= (null_bytes[idx] as u64) << (b * 8);
-                }
-            }
-            *word &= mask;
+        for (word, mask) in self.words.iter_mut().zip(nulls.words()) {
+            *word &= *mask;
         }
         self.recount();
+    }
+
+    /// Clear bits where the null bitmap indicates null (bit clear in NullBitmap = null),
+    /// without refreshing the cached popcount. Call `recount()` after the final mask.
+    pub fn mask_non_null_unchecked(&mut self, nulls: &NullBitmap) {
+        for (word, mask) in self.words.iter_mut().zip(nulls.words()) {
+            *word &= *mask;
+        }
     }
 
     /// Keep only bits where the null bitmap indicates null (bit clear in NullBitmap = null).
     pub fn mask_null(&mut self, nulls: &NullBitmap) {
-        let null_bytes = nulls.data();
-        for (word_idx, word) in self.words.iter_mut().enumerate() {
-            let byte_offset = word_idx * 8;
-            let mut mask: u64 = 0;
-            for b in 0..8 {
-                let idx = byte_offset + b;
-                if idx < null_bytes.len() {
-                    mask |= (null_bytes[idx] as u64) << (b * 8);
-                }
-            }
-            // Invert: keep positions that are null (clear in NullBitmap).
-            *word &= !mask;
-        }
-        // Clear any trailing bits beyond len.
-        let remainder = self.len % 64;
-        if remainder > 0 && !self.words.is_empty() {
-            *self.words.last_mut().unwrap() &= (1u64 << remainder) - 1;
-        }
+        self.mask_null_unchecked(nulls);
         self.recount();
     }
 
-    /// Mutable access to raw u64 words for vectorized filter producers.
-    pub fn words_mut(&mut self) -> &mut [u64] {
-        &mut self.words
+    /// Keep only bits where the null bitmap indicates null (bit clear in NullBitmap = null),
+    /// without refreshing the cached popcount. Call `recount()` after the final mask.
+    pub fn mask_null_unchecked(&mut self, nulls: &NullBitmap) {
+        for (word, mask) in self.words.iter_mut().zip(nulls.words()) {
+            *word &= !*mask;
+        }
+        self.clear_unused_bits();
+    }
+
+    pub fn retain_from_predicate_unchecked<F>(&mut self, mut pred: F)
+    where
+        F: FnMut(usize) -> bool,
+    {
+        for (word_idx, word) in self.words.iter_mut().enumerate() {
+            let current = *word;
+            if current == 0 {
+                continue;
+            }
+
+            let base = word_idx * 64;
+            let mut remaining = current;
+            let mut retained = 0u64;
+            while remaining != 0 {
+                let tz = remaining.trailing_zeros() as usize;
+                let mask = 1u64 << tz;
+                if pred(base + tz) {
+                    retained |= mask;
+                }
+                remaining &= remaining - 1;
+            }
+            *word = retained;
+        }
     }
 
     /// Recompute cached popcount from words.
@@ -122,6 +137,13 @@ impl SelectionBitmap {
             },
             base: 0,
             len: self.len,
+        }
+    }
+
+    fn clear_unused_bits(&mut self) {
+        let remainder = self.len % 64;
+        if remainder > 0 && !self.words.is_empty() {
+            *self.words.last_mut().unwrap() &= (1u64 << remainder) - 1;
         }
     }
 }
@@ -240,5 +262,18 @@ mod tests {
         let bm = SelectionBitmap::all(1);
         assert_eq!(bm.count(), 1);
         assert_eq!(bm.iter_set().collect::<Vec<_>>(), vec![0]);
+    }
+
+    #[test]
+    fn mask_non_null_handles_non_aligned_lengths() {
+        let present = (0..65).map(|index| index % 3 != 0).collect::<Vec<_>>();
+        let nulls = NullBitmap::from_bools(&present);
+
+        let mut bitmap = SelectionBitmap::all(65);
+        bitmap.mask_non_null(&nulls);
+
+        let expected = present.iter().filter(|&&is_present| is_present).count();
+        assert_eq!(bitmap.count(), expected);
+        assert!(bitmap.iter_set().all(|index| present[index]));
     }
 }

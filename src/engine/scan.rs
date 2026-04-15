@@ -1,6 +1,7 @@
 use anyhow::{Result, bail};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
+use smallvec::SmallVec;
 
 use crate::sql::CompareOp;
 use crate::storage::{ColumnData, ColumnStats, LoadedRowGroup, Table};
@@ -10,14 +11,13 @@ use super::aggregate::AggState;
 use super::bitmap::SelectionBitmap;
 use super::compile::{CompiledFilter, CompiledProjection, LocalKeyPart};
 
-const PARALLEL_ROW_GROUPS: usize = 4;
-
 // ---------------------------------------------------------------------------
 // Parallel scan — replaces the old sequential visitor-based scan_table
 // ---------------------------------------------------------------------------
 
 pub(super) fn parallel_scan_table<F>(
     table: &Table,
+    query_threads: usize,
     mapped: Option<&[u8]>,
     filters: &[CompiledFilter],
     required_columns: &[usize],
@@ -26,6 +26,9 @@ pub(super) fn parallel_scan_table<F>(
 where
     F: Fn(&LoadedRowGroup<'_>, usize) -> Vec<Value> + Sync + Send,
 {
+    let parallelize_row_groups = query_threads > 1 && table.row_groups.len() >= 2;
+    let parallelize_rows = query_threads > 1 && table.row_groups.len() < query_threads;
+
     let process = |stored: &crate::storage::StoredRowGroup| -> Result<Vec<Vec<Value>>> {
         if !row_group_matches(stored.rows(), stored.stats(), filters) {
             return Ok(Vec::new());
@@ -35,14 +38,16 @@ where
         if selection.is_empty() {
             return Ok(Vec::new());
         }
-        let mut rows = Vec::with_capacity(selection.count());
-        for row_idx in selection.iter_set() {
-            rows.push(extractor(&loaded, row_idx));
-        }
-        Ok(rows)
+        extract_selected_rows(
+            &loaded,
+            &selection,
+            query_threads,
+            parallelize_rows,
+            &extractor,
+        )
     };
 
-    let chunks: Vec<Result<Vec<Vec<Value>>>> = if table.row_groups.len() >= PARALLEL_ROW_GROUPS {
+    let chunks: Vec<Result<Vec<Vec<Value>>>> = if parallelize_row_groups {
         table.row_groups.par_iter().map(process).collect()
     } else {
         table.row_groups.iter().map(process).collect()
@@ -61,6 +66,7 @@ where
 
 pub(super) fn collect_row_group_aggregates<T, F>(
     table: &Table,
+    query_threads: usize,
     mapped: Option<&[u8]>,
     filters: &[CompiledFilter],
     required_columns: &[usize],
@@ -70,7 +76,8 @@ where
     T: Send,
     F: Fn(&LoadedRowGroup<'_>) -> Result<T> + Sync + Send,
 {
-    let partials = if table.row_groups.len() >= PARALLEL_ROW_GROUPS {
+    let parallelize_row_groups = query_threads > 1 && table.row_groups.len() >= 2;
+    let partials = if parallelize_row_groups {
         table
             .row_groups
             .par_iter()
@@ -98,11 +105,19 @@ pub(super) fn aggregate_row_group_all(
     row_group: &LoadedRowGroup<'_>,
     filters: &[CompiledFilter],
     projections: &[CompiledProjection],
+    query_threads: usize,
+    parallelize_rows: bool,
 ) -> Result<Option<Vec<AggState>>> {
     let selection = select_rows_bitmap(row_group, filters);
     if selection.is_empty() {
         return Ok(None);
     }
+
+    if parallelize_rows && selection.count() >= 65_536 {
+        return aggregate_row_group_all_parallel(row_group, projections, &selection, query_threads)
+            .map(Some);
+    }
+
     let mut states = projections.iter().map(AggState::new).collect::<Vec<_>>();
     for row in selection.iter_set() {
         for (state, projection) in states.iter_mut().zip(projections) {
@@ -117,10 +132,22 @@ pub(super) fn aggregate_row_group_grouped(
     filters: &[CompiledFilter],
     projections: &[CompiledProjection],
     group_indexes: &[usize],
+    query_threads: usize,
+    parallelize_rows: bool,
 ) -> Result<FxHashMap<Vec<Value>, Vec<AggState>>> {
     let selection = select_rows_bitmap(row_group, filters);
     if selection.is_empty() {
         return Ok(FxHashMap::default());
+    }
+
+    if parallelize_rows && selection.count() >= 32_768 {
+        return aggregate_row_group_grouped_parallel(
+            row_group,
+            projections,
+            group_indexes,
+            &selection,
+            query_threads,
+        );
     }
 
     // Fast path: single StringDict GROUP BY column — use array-indexed aggregation.
@@ -136,12 +163,13 @@ pub(super) fn aggregate_row_group_grouped(
         }
     }
 
-    let mut local_groups: FxHashMap<Vec<LocalKeyPart>, Vec<AggState>> = FxHashMap::default();
+    let mut local_groups: FxHashMap<SmallVec<[LocalKeyPart; 4]>, Vec<AggState>> =
+        FxHashMap::default();
     for row in selection.iter_set() {
         let key = group_indexes
             .iter()
             .map(|index| LocalKeyPart::from_column(row_group.column(*index), row))
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<SmallVec<[LocalKeyPart; 4]>>>()?;
         let states = local_groups
             .entry(key)
             .or_insert_with(|| projections.iter().map(AggState::new).collect());
@@ -156,6 +184,240 @@ pub(super) fn aggregate_row_group_grouped(
         materialized.insert(key, local_states);
     }
     Ok(materialized)
+}
+
+pub(super) fn count_row_group_int64(
+    row_group: &LoadedRowGroup<'_>,
+    filters: &[CompiledFilter],
+    key_index: usize,
+    query_threads: usize,
+    parallelize_rows: bool,
+) -> Result<FxHashMap<i64, i64>> {
+    let selection = select_rows_bitmap(row_group, filters);
+    if selection.is_empty() {
+        return Ok(FxHashMap::default());
+    }
+
+    let ColumnData::Int64(values) = row_group.column(key_index) else {
+        bail!("fast grouped count expects an int64-compatible key column")
+    };
+
+    if parallelize_rows && selection.count() >= 32_768 {
+        let selected_rows = selection.iter_set().collect::<Vec<_>>();
+        let chunk_count = parallel_chunk_count(selected_rows.len(), query_threads);
+        if chunk_count > 1 {
+            let chunk_size = selected_rows.len().div_ceil(chunk_count);
+            let partials = selected_rows
+                .par_chunks(chunk_size)
+                .map(|chunk| {
+                    let mut local = FxHashMap::default();
+                    for &row in chunk {
+                        *local.entry(values[row]).or_insert(0) += 1;
+                    }
+                    local
+                })
+                .collect::<Vec<_>>();
+            let mut merged = FxHashMap::default();
+            for partial in partials {
+                for (key, count) in partial {
+                    *merged.entry(key).or_insert(0) += count;
+                }
+            }
+            return Ok(merged);
+        }
+    }
+
+    let mut counts = FxHashMap::default();
+    for row in selection.iter_set() {
+        *counts.entry(values[row]).or_insert(0) += 1;
+    }
+    Ok(counts)
+}
+
+pub(super) fn count_row_group_bool(
+    row_group: &LoadedRowGroup<'_>,
+    filters: &[CompiledFilter],
+    key_index: usize,
+) -> Result<[i64; 2]> {
+    let selection = select_rows_bitmap(row_group, filters);
+    if selection.is_empty() {
+        return Ok([0, 0]);
+    }
+
+    let ColumnData::Bool(values) = row_group.column(key_index) else {
+        bail!("fast grouped count expects a bool key column")
+    };
+
+    let mut counts = [0_i64; 2];
+    for row in selection.iter_set() {
+        counts[values[row] as usize] += 1;
+    }
+    Ok(counts)
+}
+
+fn extract_selected_rows<F>(
+    row_group: &LoadedRowGroup<'_>,
+    selection: &SelectionBitmap,
+    query_threads: usize,
+    parallelize_rows: bool,
+    extractor: &F,
+) -> Result<Vec<Vec<Value>>>
+where
+    F: Fn(&LoadedRowGroup<'_>, usize) -> Vec<Value> + Sync + Send,
+{
+    if !parallelize_rows || selection.count() < 65_536 {
+        let mut rows = Vec::with_capacity(selection.count());
+        for row_idx in selection.iter_set() {
+            rows.push(extractor(row_group, row_idx));
+        }
+        return Ok(rows);
+    }
+
+    let selected_rows = selection.iter_set().collect::<Vec<_>>();
+    let chunk_count = parallel_chunk_count(selected_rows.len(), query_threads);
+    if chunk_count <= 1 {
+        return Ok(selected_rows
+            .into_iter()
+            .map(|row_idx| extractor(row_group, row_idx))
+            .collect());
+    }
+
+    let chunk_size = selected_rows.len().div_ceil(chunk_count);
+    let chunks = selected_rows
+        .par_chunks(chunk_size)
+        .map(|chunk| {
+            chunk
+                .iter()
+                .map(|&row_idx| extractor(row_group, row_idx))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    Ok(chunks.into_iter().flatten().collect())
+}
+
+fn aggregate_row_group_all_parallel(
+    row_group: &LoadedRowGroup<'_>,
+    projections: &[CompiledProjection],
+    selection: &SelectionBitmap,
+    query_threads: usize,
+) -> Result<Vec<AggState>> {
+    let selected_rows = selection.iter_set().collect::<Vec<_>>();
+    let chunk_count = parallel_chunk_count(selected_rows.len(), query_threads);
+    if chunk_count <= 1 {
+        let mut states = projections.iter().map(AggState::new).collect::<Vec<_>>();
+        for row in selected_rows {
+            for (state, projection) in states.iter_mut().zip(projections) {
+                state.update(projection, row_group, row)?;
+            }
+        }
+        return Ok(states);
+    }
+
+    let chunk_size = selected_rows.len().div_ceil(chunk_count);
+    let partials = selected_rows
+        .par_chunks(chunk_size)
+        .map(|chunk| {
+            let mut states = projections.iter().map(AggState::new).collect::<Vec<_>>();
+            for &row in chunk {
+                for (state, projection) in states.iter_mut().zip(projections) {
+                    state.update(projection, row_group, row)?;
+                }
+            }
+            Ok::<_, anyhow::Error>(states)
+        })
+        .collect::<Vec<_>>();
+
+    let mut merged = projections.iter().map(AggState::new).collect::<Vec<_>>();
+    for partial in partials {
+        for (state, partial_state) in merged.iter_mut().zip(partial?) {
+            state.merge(partial_state)?;
+        }
+    }
+    Ok(merged)
+}
+
+fn aggregate_row_group_grouped_parallel(
+    row_group: &LoadedRowGroup<'_>,
+    projections: &[CompiledProjection],
+    group_indexes: &[usize],
+    selection: &SelectionBitmap,
+    query_threads: usize,
+) -> Result<FxHashMap<Vec<Value>, Vec<AggState>>> {
+    let selected_rows = selection.iter_set().collect::<Vec<_>>();
+    let chunk_count = parallel_chunk_count(selected_rows.len(), query_threads);
+    if chunk_count <= 1 {
+        let mut local_groups: FxHashMap<SmallVec<[LocalKeyPart; 4]>, Vec<AggState>> =
+            FxHashMap::default();
+        for row in selected_rows {
+            let key = group_indexes
+                .iter()
+                .map(|index| LocalKeyPart::from_column(row_group.column(*index), row))
+                .collect::<Result<SmallVec<[LocalKeyPart; 4]>>>()?;
+            let states = local_groups
+                .entry(key)
+                .or_insert_with(|| projections.iter().map(AggState::new).collect());
+            for (state, projection) in states.iter_mut().zip(projections) {
+                state.update(projection, row_group, row)?;
+            }
+        }
+        let mut materialized = FxHashMap::default();
+        for (local_key, local_states) in local_groups {
+            let key = materialize_group_key(row_group, group_indexes, &local_key)?;
+            materialized.insert(key, local_states);
+        }
+        return Ok(materialized);
+    }
+
+    let chunk_size = selected_rows.len().div_ceil(chunk_count);
+    let partials = selected_rows
+        .par_chunks(chunk_size)
+        .map(|chunk| {
+            let mut local_groups: FxHashMap<SmallVec<[LocalKeyPart; 4]>, Vec<AggState>> =
+                FxHashMap::default();
+            for &row in chunk {
+                let key = group_indexes
+                    .iter()
+                    .map(|index| LocalKeyPart::from_column(row_group.column(*index), row))
+                    .collect::<Result<SmallVec<[LocalKeyPart; 4]>>>()?;
+                let states = local_groups
+                    .entry(key)
+                    .or_insert_with(|| projections.iter().map(AggState::new).collect());
+                for (state, projection) in states.iter_mut().zip(projections) {
+                    state.update(projection, row_group, row)?;
+                }
+            }
+            Ok::<_, anyhow::Error>(local_groups)
+        })
+        .collect::<Vec<_>>();
+
+    let mut local_groups: FxHashMap<SmallVec<[LocalKeyPart; 4]>, Vec<AggState>> =
+        FxHashMap::default();
+    for partial in partials {
+        for (key, partial_states) in partial? {
+            let states = local_groups
+                .entry(key)
+                .or_insert_with(|| projections.iter().map(AggState::new).collect());
+            for (state, partial_state) in states.iter_mut().zip(partial_states) {
+                state.merge(partial_state)?;
+            }
+        }
+    }
+
+    let mut materialized = FxHashMap::default();
+    for (local_key, local_states) in local_groups {
+        let key = materialize_group_key(row_group, group_indexes, &local_key)?;
+        materialized.insert(key, local_states);
+    }
+    Ok(materialized)
+}
+
+fn parallel_chunk_count(selected_rows: usize, query_threads: usize) -> usize {
+    if selected_rows == 0 {
+        return 0;
+    }
+    let max_tasks = query_threads.saturating_mul(4).max(1);
+    let rows_per_task = 16_384;
+    selected_rows.div_ceil(rows_per_task).clamp(1, max_tasks)
 }
 
 /// Array-indexed aggregation for a single StringDict GROUP BY column.
@@ -271,96 +533,88 @@ fn select_rows_bitmap(
         return SelectionBitmap::all(row_group.rows);
     }
 
-    let mut bitmap = evaluate_filter_bitmap(row_group, &filters[0]);
-    for filter in &filters[1..] {
+    let mut bitmap = SelectionBitmap::all(row_group.rows);
+    for filter in filters {
         if bitmap.is_empty() {
             break;
         }
-        bitmap.intersect(&evaluate_filter_bitmap(row_group, filter));
+        apply_filter_bitmap(row_group, filter, &mut bitmap);
     }
     bitmap
 }
 
-fn evaluate_filter_bitmap(
+fn apply_filter_bitmap(
     row_group: &LoadedRowGroup<'_>,
     filter: &CompiledFilter,
-) -> SelectionBitmap {
+    bitmap: &mut SelectionBitmap,
+) {
     let nulls = row_group.nulls(filter.column_index);
 
-    // Handle IS NULL / IS NOT NULL directly from null bitmap.
     match filter.op {
         CompareOp::IsNull => {
-            return match nulls {
-                Some(n) => {
-                    let mut bm = SelectionBitmap::all(row_group.rows);
-                    bm.mask_null(n);
-                    bm
-                }
-                None => SelectionBitmap::none(row_group.rows),
-            };
+            match nulls {
+                Some(n) => bitmap.mask_null(n),
+                None => bitmap.clear(),
+            }
+            return;
         }
         CompareOp::IsNotNull => {
-            return match nulls {
-                Some(n) => {
-                    let mut bm = SelectionBitmap::all(row_group.rows);
-                    bm.mask_non_null(n);
-                    bm
-                }
-                None => SelectionBitmap::all(row_group.rows),
-            };
+            if let Some(n) = nulls {
+                bitmap.mask_non_null(n);
+            }
+            return;
         }
         _ => {}
     }
 
     let column = row_group.column(filter.column_index);
-    let mut bitmap = evaluate_column_filter(column, filter.op, &filter.value, row_group.rows);
+    apply_column_filter(column, filter.op, &filter.value, bitmap);
 
     // Null values must not pass non-null filters (SQL semantics).
     if let Some(n) = nulls {
-        bitmap.mask_non_null(n);
+        bitmap.mask_non_null_unchecked(n);
     }
-    bitmap
-}
-
-fn evaluate_column_filter(
-    column: &ColumnData,
-    op: CompareOp,
-    value: &Value,
-    rows: usize,
-) -> SelectionBitmap {
-    match (column, value) {
-        (ColumnData::Int64(values), Value::Int64(target)) => eval_int64(values, *target, op, rows),
-        (ColumnData::Int64(values), Value::Float64(target)) => {
-            eval_int64_vs_float(values, target.into_inner(), op, rows)
-        }
-        (ColumnData::Float64(values), Value::Float64(target)) => {
-            eval_float64(values, *target, op, rows)
-        }
-        (ColumnData::Float64(values), Value::Int64(target)) => eval_float64(
-            values,
-            ordered_float::OrderedFloat(*target as f64),
-            op,
-            rows,
-        ),
-        (ColumnData::Bool(values), Value::Bool(target)) => eval_bool(values, *target, op, rows),
-        (ColumnData::StringDict { dictionary, codes }, Value::String(target)) => {
-            eval_string_dict(dictionary, codes, target, op, rows)
-        }
-        (ColumnData::StringPlain(values), Value::String(target)) => {
-            eval_string_plain(values, target, op, rows)
-        }
-        _ => {
-            // Type mismatch: no rows match.
-            SelectionBitmap::none(rows)
-        }
-    }
+    bitmap.recount();
 }
 
 // ---------------------------------------------------------------------------
 // Type-specialized vectorized evaluators
 // ---------------------------------------------------------------------------
 
-fn eval_int64(values: &[i64], target: i64, op: CompareOp, rows: usize) -> SelectionBitmap {
+fn apply_column_filter(
+    column: &ColumnData,
+    op: CompareOp,
+    value: &Value,
+    bitmap: &mut SelectionBitmap,
+) {
+    match (column, value) {
+        (ColumnData::Int64(values), Value::Int64(target)) => {
+            apply_int64(values, *target, op, bitmap);
+        }
+        (ColumnData::Int64(values), Value::Float64(target)) => {
+            apply_int64_vs_float(values, target.into_inner(), op, bitmap);
+        }
+        (ColumnData::Float64(values), Value::Float64(target)) => {
+            apply_float64(values, *target, op, bitmap);
+        }
+        (ColumnData::Float64(values), Value::Int64(target)) => apply_float64(
+            values,
+            ordered_float::OrderedFloat(*target as f64),
+            op,
+            bitmap,
+        ),
+        (ColumnData::Bool(values), Value::Bool(target)) => apply_bool(values, *target, op, bitmap),
+        (ColumnData::StringDict { dictionary, codes }, Value::String(target)) => {
+            apply_string_dict(dictionary, codes, target, op, bitmap)
+        }
+        (ColumnData::StringPlain(values), Value::String(target)) => {
+            apply_string_plain(values, target, op, bitmap)
+        }
+        _ => bitmap.clear(),
+    }
+}
+
+fn apply_int64(values: &[i64], target: i64, op: CompareOp, bitmap: &mut SelectionBitmap) {
     let pred: fn(i64, i64) -> bool = match op {
         CompareOp::Eq => |a, b| a == b,
         CompareOp::NotEq => |a, b| a != b,
@@ -370,10 +624,10 @@ fn eval_int64(values: &[i64], target: i64, op: CompareOp, rows: usize) -> Select
         CompareOp::Gte => |a, b| a >= b,
         _ => unreachable!(),
     };
-    build_bitmap_from_predicate(rows, |i| pred(values[i], target))
+    bitmap.retain_from_predicate_unchecked(|i| pred(values[i], target));
 }
 
-fn eval_int64_vs_float(values: &[i64], target: f64, op: CompareOp, rows: usize) -> SelectionBitmap {
+fn apply_int64_vs_float(values: &[i64], target: f64, op: CompareOp, bitmap: &mut SelectionBitmap) {
     let pred: fn(f64, f64) -> bool = match op {
         CompareOp::Eq => |a, b| a == b,
         CompareOp::NotEq => |a, b| a != b,
@@ -383,15 +637,15 @@ fn eval_int64_vs_float(values: &[i64], target: f64, op: CompareOp, rows: usize) 
         CompareOp::Gte => |a, b| a >= b,
         _ => unreachable!(),
     };
-    build_bitmap_from_predicate(rows, |i| pred(values[i] as f64, target))
+    bitmap.retain_from_predicate_unchecked(|i| pred(values[i] as f64, target));
 }
 
-fn eval_float64(
+fn apply_float64(
     values: &[ordered_float::OrderedFloat<f64>],
     target: ordered_float::OrderedFloat<f64>,
     op: CompareOp,
-    rows: usize,
-) -> SelectionBitmap {
+    bitmap: &mut SelectionBitmap,
+) {
     let pred: fn(ordered_float::OrderedFloat<f64>, ordered_float::OrderedFloat<f64>) -> bool =
         match op {
             CompareOp::Eq => |a, b| a == b,
@@ -402,44 +656,40 @@ fn eval_float64(
             CompareOp::Gte => |a, b| a >= b,
             _ => unreachable!(),
         };
-    build_bitmap_from_predicate(rows, |i| pred(values[i], target))
+    bitmap.retain_from_predicate_unchecked(|i| pred(values[i], target));
 }
 
-fn eval_bool(values: &[bool], target: bool, op: CompareOp, rows: usize) -> SelectionBitmap {
+fn apply_bool(values: &[bool], target: bool, op: CompareOp, bitmap: &mut SelectionBitmap) {
     match op {
-        CompareOp::Eq => build_bitmap_from_predicate(rows, |i| values[i] == target),
-        CompareOp::NotEq => build_bitmap_from_predicate(rows, |i| values[i] != target),
-        _ => SelectionBitmap::none(rows),
+        CompareOp::Eq => bitmap.retain_from_predicate_unchecked(|i| values[i] == target),
+        CompareOp::NotEq => bitmap.retain_from_predicate_unchecked(|i| values[i] != target),
+        _ => bitmap.clear(),
     }
 }
 
-fn eval_string_dict(
+fn apply_string_dict(
     dictionary: &[String],
     codes: &[u32],
     target: &str,
     op: CompareOp,
-    rows: usize,
-) -> SelectionBitmap {
+    bitmap: &mut SelectionBitmap,
+) {
     match op {
-        CompareOp::Eq => {
-            // Find matching code in dictionary, then compare as integers.
-            match dictionary.iter().position(|s| s == target) {
-                Some(code) => {
-                    let code = code as u32;
-                    build_bitmap_from_predicate(rows, |i| codes[i] == code)
-                }
-                None => SelectionBitmap::none(rows),
+        CompareOp::Eq => match dictionary.iter().position(|s| s == target) {
+            Some(code) => {
+                let code = code as u32;
+                bitmap.retain_from_predicate_unchecked(|i| codes[i] == code);
             }
-        }
+            None => bitmap.clear(),
+        },
         CompareOp::NotEq => match dictionary.iter().position(|s| s == target) {
             Some(code) => {
                 let code = code as u32;
-                build_bitmap_from_predicate(rows, |i| codes[i] != code)
+                bitmap.retain_from_predicate_unchecked(|i| codes[i] != code);
             }
-            None => SelectionBitmap::all(rows),
+            None => {}
         },
         _ => {
-            // Range comparisons: build a lookup table for matching codes.
             let pred: fn(&str, &str) -> bool = match op {
                 CompareOp::Lt => |a, b| a < b,
                 CompareOp::Lte => |a, b| a <= b,
@@ -448,17 +698,17 @@ fn eval_string_dict(
                 _ => unreachable!(),
             };
             let matching_codes: Vec<bool> = dictionary.iter().map(|s| pred(s, target)).collect();
-            build_bitmap_from_predicate(rows, |i| matching_codes[codes[i] as usize])
+            bitmap.retain_from_predicate_unchecked(|i| matching_codes[codes[i] as usize]);
         }
     }
 }
 
-fn eval_string_plain(
+fn apply_string_plain(
     values: &[String],
     target: &str,
     op: CompareOp,
-    rows: usize,
-) -> SelectionBitmap {
+    bitmap: &mut SelectionBitmap,
+) {
     let pred: fn(&str, &str) -> bool = match op {
         CompareOp::Eq => |a, b| a == b,
         CompareOp::NotEq => |a, b| a != b,
@@ -468,41 +718,7 @@ fn eval_string_plain(
         CompareOp::Gte => |a, b| a >= b,
         _ => unreachable!(),
     };
-    build_bitmap_from_predicate(rows, |i| pred(&values[i], target))
-}
-
-// ---------------------------------------------------------------------------
-// Bitmap building helper — processes in 64-element chunks for auto-vectorization
-// ---------------------------------------------------------------------------
-
-#[inline]
-fn build_bitmap_from_predicate<F>(rows: usize, pred: F) -> SelectionBitmap
-where
-    F: Fn(usize) -> bool,
-{
-    let mut bitmap = SelectionBitmap::none(rows);
-    let words = bitmap.words_mut();
-    let full_words = rows / 64;
-    for word_idx in 0..full_words {
-        let base = word_idx * 64;
-        let mut word: u64 = 0;
-        for bit in 0..64 {
-            word |= (pred(base + bit) as u64) << bit;
-        }
-        words[word_idx] = word;
-    }
-    // Handle the remainder.
-    let remainder = rows % 64;
-    if remainder > 0 {
-        let base = full_words * 64;
-        let mut word: u64 = 0;
-        for bit in 0..remainder {
-            word |= (pred(base + bit) as u64) << bit;
-        }
-        words[full_words] = word;
-    }
-    bitmap.recount();
-    bitmap
+    bitmap.retain_from_predicate_unchecked(|i| pred(&values[i], target));
 }
 
 // ---------------------------------------------------------------------------

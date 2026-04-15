@@ -2,7 +2,7 @@ use std::fmt::Debug;
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
 use futures::{Stream, stream};
 use narrowdb::{DbOptions, NarrowDb, QueryResult, Value};
@@ -34,6 +34,7 @@ async fn main() -> Result<()> {
         DbOptions {
             row_group_size: config.row_group_size,
             sync_on_flush: config.sync_on_flush,
+            query_threads: config.query_threads,
             ..DbOptions::default()
         },
     )?);
@@ -65,6 +66,7 @@ struct ServerConfig {
     listen_addr: String,
     row_group_size: usize,
     sync_on_flush: bool,
+    query_threads: Option<usize>,
     user: String,
     password: String,
 }
@@ -77,7 +79,7 @@ impl ServerConfig {
             val
         } else {
             bail!(
-                "usage: narrowdb-server <db-file> [--listen 127.0.0.1:5433] [--row-group-size 16384] [--sync-on-flush true|false] [--user narrowdb] [--password secret]\n\nAll flags can also be set via environment variables: NARROWDB_PATH, NARROWDB_LISTEN, NARROWDB_ROW_GROUP_SIZE, NARROWDB_SYNC_ON_FLUSH, NARROWDB_USER, NARROWDB_PASSWORD"
+                "usage: narrowdb-server <db-file> [--listen 127.0.0.1:5433] [--row-group-size 16384] [--sync-on-flush true|false] [--query-threads N] [--user narrowdb] [--password secret]\n\nAll flags can also be set via environment variables: NARROWDB_PATH, NARROWDB_LISTEN, NARROWDB_ROW_GROUP_SIZE, NARROWDB_SYNC_ON_FLUSH, NARROWDB_QUERY_THREADS, NARROWDB_USER, NARROWDB_PASSWORD"
             );
         };
 
@@ -86,6 +88,10 @@ impl ServerConfig {
             .parse()
             .context("NARROWDB_ROW_GROUP_SIZE must be an integer")?;
         let mut sync_on_flush = parse_bool_flag(&env_or("NARROWDB_SYNC_ON_FLUSH", "true"))?;
+        let mut query_threads = std::env::var("NARROWDB_QUERY_THREADS")
+            .ok()
+            .map(|value| parse_query_threads_flag(&value))
+            .transpose()?;
         let mut user = env_or("NARROWDB_USER", "narrowdb");
         let mut password = env_or("NARROWDB_PASSWORD", "narrowdb");
         let mut index = 1;
@@ -114,6 +120,13 @@ impl ServerConfig {
                             .context("missing value for --sync-on-flush")?,
                     )?;
                 }
+                "--query-threads" => {
+                    index += 1;
+                    query_threads = Some(parse_query_threads_flag(
+                        args.get(index)
+                            .context("missing value for --query-threads")?,
+                    )?);
+                }
                 "--user" => {
                     index += 1;
                     user = args.get(index).context("missing value for --user")?.clone();
@@ -135,6 +148,7 @@ impl ServerConfig {
             listen_addr,
             row_group_size,
             sync_on_flush,
+            query_threads,
             user,
             password,
         })
@@ -159,6 +173,14 @@ fn parse_bool_flag(value: &str) -> Result<bool> {
         "false" | "0" | "no" | "off" => Ok(false),
         _ => bail!("expected boolean value, got {value}"),
     }
+}
+
+fn parse_query_threads_flag(value: &str) -> Result<usize> {
+    let threads = value
+        .parse::<usize>()
+        .context("query threads must be an integer")?;
+    ensure!(threads > 0, "query threads must be greater than zero");
+    Ok(threads)
 }
 
 #[derive(Debug)]
@@ -564,6 +586,27 @@ mod tests {
 
     use tokio_postgres::NoTls;
 
+    #[test]
+    fn parses_query_threads_flag() -> Result<()> {
+        let config = ServerConfig::from_args(vec![
+            "/tmp/test.narrowdb".to_string(),
+            "--query-threads".to_string(),
+            "4".to_string(),
+        ])?;
+        assert_eq!(config.query_threads, Some(4));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_zero_query_threads_flag() {
+        let err = ServerConfig::from_args(vec![
+            "/tmp/test.narrowdb".to_string(),
+            "--query-threads".to_string(),
+            "0".to_string(),
+        ]);
+        assert!(err.is_err());
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn accepts_postgres_client_with_auth() -> Result<()> {
         let db_path = std::env::temp_dir().join(format!(
@@ -575,6 +618,7 @@ mod tests {
             listen_addr: "127.0.0.1:0".to_string(),
             row_group_size: 128,
             sync_on_flush: true,
+            query_threads: Some(2),
             user: "narrowdb".to_string(),
             password: "secret".to_string(),
         };
@@ -584,6 +628,7 @@ mod tests {
             DbOptions {
                 row_group_size: config.row_group_size,
                 sync_on_flush: config.sync_on_flush,
+                query_threads: config.query_threads,
                 ..DbOptions::default()
             },
         )?);

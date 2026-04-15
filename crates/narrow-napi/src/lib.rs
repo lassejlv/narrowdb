@@ -66,6 +66,7 @@ pub struct JsDbOptions {
     pub row_group_size: Option<u32>,
     pub sync_on_flush: Option<bool>,
     pub auto_flush_interval_ms: Option<u32>,
+    pub query_threads: Option<u32>,
 }
 
 #[napi(object)]
@@ -152,9 +153,7 @@ impl JsValue {
             "bool" => Ok(Value::Bool(self.bool_val.unwrap_or(false))),
             "int64" => Ok(Value::Int64(self.int64.unwrap_or(0))),
             "float64" => Ok(Value::Float64(OrderedFloat(self.float64.unwrap_or(0.0)))),
-            "string" => Ok(Value::String(
-                self.string_val.clone().unwrap_or_default(),
-            )),
+            "string" => Ok(Value::String(self.string_val.clone().unwrap_or_default())),
             other => Err(napi::Error::new(
                 napi::Status::InvalidArg,
                 format!("unknown value type: {other}"),
@@ -190,6 +189,7 @@ fn convert_options(opts: Option<JsDbOptions>) -> DbOptions {
             auto_flush_interval: o
                 .auto_flush_interval_ms
                 .map(|ms| Duration::from_millis(ms as u64)),
+            query_threads: o.query_threads.map(|threads| threads as usize),
         },
     }
 }
@@ -215,9 +215,7 @@ fn convert_batch_column(bc: JsBatchColumn) -> Result<BatchColumn> {
         JsDataType::Float64 => Ok(BatchColumn::Float64(bc.float64_values.unwrap_or_default())),
         JsDataType::Bool => Ok(BatchColumn::Bool(bc.bool_values.unwrap_or_default())),
         JsDataType::String => Ok(BatchColumn::String(bc.string_values.unwrap_or_default())),
-        JsDataType::Timestamp => Ok(BatchColumn::Timestamp(
-            bc.int64_values.unwrap_or_default(),
-        )),
+        JsDataType::Timestamp => Ok(BatchColumn::Timestamp(bc.int64_values.unwrap_or_default())),
     }
 }
 
@@ -295,11 +293,7 @@ impl NarrowDatabase {
     }
 
     #[napi]
-    pub fn insert_columnar_batch(
-        &self,
-        table_name: String,
-        batch: JsColumnarBatch,
-    ) -> Result<()> {
+    pub fn insert_columnar_batch(&self, table_name: String, batch: JsColumnarBatch) -> Result<()> {
         let columns: Vec<BatchColumn> = batch
             .columns
             .into_iter()
@@ -319,5 +313,21 @@ impl NarrowDatabase {
     #[napi]
     pub fn flush_all(&self) -> Result<()> {
         self.inner.flush_all().map_err(to_napi_err)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn converts_query_threads_option() {
+        let options = convert_options(Some(JsDbOptions {
+            row_group_size: None,
+            sync_on_flush: None,
+            auto_flush_interval_ms: None,
+            query_threads: Some(4),
+        }));
+        assert_eq!(options.query_threads, Some(4));
     }
 }

@@ -7,7 +7,9 @@ const DB_PATH: &str = "/tmp/bench-narrowdb.db";
 const BATCH_SIZE: usize = 65_536;
 
 fn main() -> Result<()> {
-    let rows = common::row_count_from_args();
+    let args = common::benchmark_args()?;
+    let rows = args.rows;
+    let query_threads = common::resolved_query_threads(args.query_threads);
     common::print_header("NarrowDB", rows);
 
     if std::path::Path::new(DB_PATH).exists() {
@@ -19,6 +21,7 @@ fn main() -> Result<()> {
         DbOptions {
             row_group_size: 32_768,
             sync_on_flush: false,
+            query_threads: Some(query_threads),
             ..DbOptions::default()
         },
     )?;

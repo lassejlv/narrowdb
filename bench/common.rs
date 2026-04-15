@@ -1,3 +1,4 @@
+use anyhow::{Context, Result, bail};
 use std::time::{Duration, Instant};
 
 pub const SERVICES: [&str; 8] = [
@@ -27,7 +28,7 @@ pub const MESSAGES: [&str; 16] = [
     "connection opened",
 ];
 
-pub const QUERIES: [(&str, &str); 3] = [
+pub const QUERIES: [(&str, &str); 6] = [
     (
         "Errors by service (filter + group by)",
         "SELECT service, COUNT(*) AS errors FROM logs WHERE ts >= 1700500000 AND level = 'error' GROUP BY service ORDER BY errors DESC LIMIT 5;",
@@ -39,6 +40,18 @@ pub const QUERIES: [(&str, &str); 3] = [
     (
         "Slow request count (filter + count)",
         "SELECT COUNT(*) AS slow_requests FROM logs WHERE duration >= 700.0;",
+    ),
+    (
+        "Multi-filter scan (projection-heavy)",
+        "SELECT ts, service, host, status FROM logs WHERE level = 'error' AND status >= 503 AND duration >= 700.0 ORDER BY ts DESC LIMIT 25;",
+    ),
+    (
+        "High-cardinality grouped count",
+        "SELECT request_id, COUNT(*) AS total FROM logs WHERE status >= 500 GROUP BY request_id ORDER BY total DESC LIMIT 25;",
+    ),
+    (
+        "Cross-row-group string group by",
+        "SELECT message, COUNT(*) AS total FROM logs WHERE bytes >= 4096 GROUP BY message ORDER BY total DESC LIMIT 10;",
     ),
 ];
 
@@ -80,11 +93,47 @@ pub fn generate_row(i: usize) -> Row {
     }
 }
 
-pub fn row_count_from_args() -> usize {
-    std::env::args()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1_000_000)
+pub struct BenchmarkArgs {
+    pub rows: usize,
+    pub query_threads: Option<usize>,
+}
+
+pub fn benchmark_args() -> Result<BenchmarkArgs> {
+    let mut rows = None;
+    let mut query_threads = None;
+    let mut args = std::env::args().skip(1);
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--query-threads" => {
+                let value = args.next().context("missing value for --query-threads")?;
+                let threads = value
+                    .parse::<usize>()
+                    .context("query threads must be an integer")?;
+                if threads == 0 {
+                    bail!("query threads must be greater than zero");
+                }
+                query_threads = Some(threads);
+            }
+            value if rows.is_none() => {
+                rows = Some(value.parse::<usize>().context("rows must be an integer")?);
+            }
+            other => bail!("unknown argument: {other}"),
+        }
+    }
+
+    Ok(BenchmarkArgs {
+        rows: rows.unwrap_or(1_000_000),
+        query_threads,
+    })
+}
+
+pub fn resolved_query_threads(query_threads: Option<usize>) -> usize {
+    query_threads.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(|threads| threads.get())
+            .unwrap_or(1)
+    })
 }
 
 pub fn timed<F: FnOnce() -> R, R>(f: F) -> (R, Duration) {
@@ -93,10 +142,12 @@ pub fn timed<F: FnOnce() -> R, R>(f: F) -> (R, Duration) {
     (result, start.elapsed())
 }
 
+#[allow(dead_code)]
 pub fn print_header(engine: &str, rows: usize) {
     println!("=== {engine} benchmark ({rows} rows) ===\n");
 }
 
+#[allow(dead_code)]
 pub fn print_ingest(elapsed: Duration, rows: usize, file_size: u64) {
     println!("Ingest: {:?}", elapsed);
     println!(
@@ -108,6 +159,7 @@ pub fn print_ingest(elapsed: Duration, rows: usize, file_size: u64) {
     println!();
 }
 
+#[allow(dead_code)]
 pub fn print_query(label: &str, elapsed: Duration, result: &QueryResult) {
     println!("{label}: {:?}", elapsed);
     if !result.columns.is_empty() {
@@ -124,7 +176,202 @@ pub fn print_query(label: &str, elapsed: Duration, result: &QueryResult) {
     println!();
 }
 
+#[allow(dead_code)]
 pub struct QueryResult {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<String>>,
+}
+
+pub struct QueryMetric {
+    pub label: &'static str,
+    pub elapsed: Duration,
+}
+
+pub struct BenchmarkReport {
+    pub engine: &'static str,
+    pub rows: usize,
+    pub query_threads: usize,
+    pub ingest_elapsed: Duration,
+    pub file_size: u64,
+    pub queries: Vec<QueryMetric>,
+}
+
+impl BenchmarkReport {
+    pub fn ingest_throughput(&self) -> f64 {
+        self.rows as f64 / self.ingest_elapsed.as_secs_f64()
+    }
+
+    pub fn bytes_per_row(&self) -> f64 {
+        self.file_size as f64 / self.rows as f64
+    }
+}
+
+pub fn print_comparison(narrow: &BenchmarkReport, duckdb: &BenchmarkReport) {
+    println!("{} vs {}", narrow.engine, duckdb.engine);
+    println!(
+        "rows={} | query_threads={}",
+        narrow.rows, narrow.query_threads
+    );
+    println!();
+
+    let summary_rows = vec![
+        comparison_row(
+            "Ingest throughput",
+            format!("{:.0} rows/s", narrow.ingest_throughput()),
+            format!("{:.0} rows/s", duckdb.ingest_throughput()),
+            compare_higher_better(
+                narrow.ingest_throughput(),
+                duckdb.ingest_throughput(),
+                "higher",
+            ),
+        ),
+        comparison_row(
+            "File size",
+            format!("{:.2} MiB", narrow.file_size as f64 / 1_048_576.0),
+            format!("{:.2} MiB", duckdb.file_size as f64 / 1_048_576.0),
+            compare_lower_better(narrow.file_size as f64, duckdb.file_size as f64, "smaller"),
+        ),
+        comparison_row(
+            "Bytes per row",
+            format!("{:.2}", narrow.bytes_per_row()),
+            format!("{:.2}", duckdb.bytes_per_row()),
+            compare_lower_better(narrow.bytes_per_row(), duckdb.bytes_per_row(), "smaller"),
+        ),
+    ];
+    println!(
+        "{}",
+        render_table(
+            ["Metric", "NarrowDB", "DuckDB", "Winner", "Delta"],
+            summary_rows
+        )
+    );
+    println!();
+
+    let query_rows = narrow
+        .queries
+        .iter()
+        .zip(&duckdb.queries)
+        .map(|(lhs, rhs)| {
+            comparison_row(
+                lhs.label,
+                format_duration(lhs.elapsed),
+                format_duration(rhs.elapsed),
+                compare_lower_better(
+                    lhs.elapsed.as_secs_f64(),
+                    rhs.elapsed.as_secs_f64(),
+                    "faster",
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
+    println!(
+        "{}",
+        render_table(
+            ["Query", "NarrowDB", "DuckDB", "Winner", "Delta"],
+            query_rows
+        )
+    );
+}
+
+fn comparison_row(
+    metric: impl Into<String>,
+    narrow: impl Into<String>,
+    duckdb: impl Into<String>,
+    verdict: (String, String),
+) -> Vec<String> {
+    vec![
+        metric.into(),
+        narrow.into(),
+        duckdb.into(),
+        verdict.0,
+        verdict.1,
+    ]
+}
+
+fn compare_higher_better(lhs: f64, rhs: f64, suffix: &str) -> (String, String) {
+    if approx_equal(lhs, rhs) {
+        return ("Tie".to_string(), "-".to_string());
+    }
+    if lhs > rhs {
+        (
+            "NarrowDB".to_string(),
+            format!("{:.2}x {suffix}", lhs / rhs),
+        )
+    } else {
+        ("DuckDB".to_string(), format!("{:.2}x {suffix}", rhs / lhs))
+    }
+}
+
+fn compare_lower_better(lhs: f64, rhs: f64, suffix: &str) -> (String, String) {
+    if approx_equal(lhs, rhs) {
+        return ("Tie".to_string(), "-".to_string());
+    }
+    if lhs < rhs {
+        (
+            "NarrowDB".to_string(),
+            format!("{:.2}x {suffix}", rhs / lhs),
+        )
+    } else {
+        ("DuckDB".to_string(), format!("{:.2}x {suffix}", lhs / rhs))
+    }
+}
+
+fn approx_equal(lhs: f64, rhs: f64) -> bool {
+    (lhs - rhs).abs() < 1e-9
+}
+
+fn format_duration(duration: Duration) -> String {
+    if duration.as_secs() >= 1 {
+        format!("{:.3}s", duration.as_secs_f64())
+    } else if duration.as_millis() >= 1 {
+        format!("{:.3}ms", duration.as_secs_f64() * 1_000.0)
+    } else {
+        format!("{:.3}us", duration.as_secs_f64() * 1_000_000.0)
+    }
+}
+
+fn render_table<const N: usize>(headers: [&str; N], rows: Vec<Vec<String>>) -> String {
+    let mut widths = headers.map(str::len);
+    for row in &rows {
+        for (index, cell) in row.iter().enumerate() {
+            widths[index] = widths[index].max(cell.len());
+        }
+    }
+
+    let separator = {
+        let mut line = String::from("+");
+        for width in widths {
+            line.push_str(&"-".repeat(width + 2));
+            line.push('+');
+        }
+        line
+    };
+
+    let mut out = String::new();
+    out.push_str(&separator);
+    out.push('\n');
+    out.push_str(&render_row(
+        &headers.map(|header| header.to_string()),
+        &widths,
+    ));
+    out.push('\n');
+    out.push_str(&separator);
+    out.push('\n');
+    for row in rows {
+        out.push_str(&render_row(&row, &widths));
+        out.push('\n');
+    }
+    out.push_str(&separator);
+    out
+}
+
+fn render_row(row: &[String], widths: &[usize]) -> String {
+    let mut line = String::from("|");
+    for (cell, width) in row.iter().zip(widths.iter()) {
+        line.push(' ');
+        line.push_str(&format!("{cell:<width$}", width = *width));
+        line.push(' ');
+        line.push('|');
+    }
+    line
 }

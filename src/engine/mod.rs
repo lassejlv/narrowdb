@@ -6,16 +6,17 @@ mod scan;
 use std::cmp::Ordering;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use rayon::{ThreadPool, ThreadPoolBuilder};
 use rustc_hash::FxHashMap;
 
 use crate::sql::{
-    AlterTableOperationPlan, AlterTablePlan, ArithmeticOp, Command, EvalPlan, OrderByPlan,
-    ProjectionExpr, ScalarExpr, SelectPlan, parse_sql,
+    AggregateKind, AlterTableOperationPlan, AlterTablePlan, ArithmeticOp, Command, EvalPlan,
+    OrderByPlan, ProjectionExpr, ScalarExpr, SelectPlan, parse_sql,
 };
 use crate::storage::{
     DbOptions, PendingBatch, Storage, StoredRowGroup, Table, row_group_from_columnar_batch,
@@ -30,7 +31,7 @@ use compile::{
 };
 use scan::{
     aggregate_row_group_all, aggregate_row_group_grouped, collect_row_group_aggregates,
-    parallel_scan_table,
+    count_row_group_bool, count_row_group_int64, parallel_scan_table,
 };
 
 pub struct NarrowDb {
@@ -39,6 +40,7 @@ pub struct NarrowDb {
 }
 
 struct DbInner {
+    query_runtime: QueryRuntime,
     storage: Storage,
     tables: FxHashMap<String, Table>,
 }
@@ -46,6 +48,26 @@ struct DbInner {
 struct FlushHandle {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+}
+
+#[derive(Clone)]
+struct QueryRuntime {
+    threads: usize,
+    pool: Arc<ThreadPool>,
+}
+
+static QUERY_THREAD_POOLS: OnceLock<Mutex<FxHashMap<usize, Arc<ThreadPool>>>> = OnceLock::new();
+
+#[derive(Clone, Copy)]
+enum FastGroupedCountKeyType {
+    Int64,
+    Bool,
+}
+
+struct FastGroupedCountPlan {
+    key_index: usize,
+    key_type: FastGroupedCountKeyType,
+    order_by_count_desc: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -63,11 +85,53 @@ impl QueryResult {
     }
 }
 
+impl QueryRuntime {
+    fn new(configured_threads: Option<usize>) -> Result<Self> {
+        let threads = match configured_threads {
+            Some(0) => bail!("query_threads must be greater than zero"),
+            Some(threads) => threads,
+            None => std::thread::available_parallelism()
+                .map(|threads| threads.get())
+                .unwrap_or(1),
+        };
+
+        Ok(Self {
+            threads,
+            pool: query_thread_pool(threads)?,
+        })
+    }
+}
+
+fn query_thread_pool(threads: usize) -> Result<Arc<ThreadPool>> {
+    let pools = QUERY_THREAD_POOLS.get_or_init(|| Mutex::new(FxHashMap::default()));
+    let mut guard = pools
+        .lock()
+        .map_err(|_| anyhow!("query thread pool lock poisoned"))?;
+    if let Some(pool) = guard.get(&threads) {
+        return Ok(pool.clone());
+    }
+
+    let pool = Arc::new(
+        ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|index| format!("narrowdb-query-{index}"))
+            .build()
+            .context("failed to build query thread pool")?,
+    );
+    guard.insert(threads, pool.clone());
+    Ok(pool)
+}
+
 impl NarrowDb {
     pub fn open(path: impl AsRef<Path>, options: DbOptions) -> Result<Self> {
+        let query_runtime = QueryRuntime::new(options.query_threads)?;
         let auto_flush_interval = options.auto_flush_interval;
         let (storage, tables) = Storage::open(path, options)?;
-        let inner = Arc::new(RwLock::new(DbInner { storage, tables }));
+        let inner = Arc::new(RwLock::new(DbInner {
+            query_runtime,
+            storage,
+            tables,
+        }));
 
         let flush_handle = if let Some(interval) = auto_flush_interval {
             let weak = Arc::downgrade(&inner);
@@ -603,18 +667,22 @@ impl DbInner {
         let required_columns = (0..table.schema.columns.len()).collect::<Vec<_>>();
         let mapped = self.storage.mapped_bytes();
         let col_count = table.schema.columns.len();
+        let query_threads = self.query_runtime.threads;
 
-        let mut rows = parallel_scan_table(
-            table,
-            mapped,
-            &filters,
-            &required_columns,
-            |row_group, row| {
-                (0..col_count)
-                    .map(|idx| row_group.column(idx).value_at(row))
-                    .collect()
-            },
-        )?;
+        let mut rows = self.query_runtime.pool.install(|| {
+            parallel_scan_table(
+                table,
+                query_threads,
+                mapped,
+                &filters,
+                &required_columns,
+                |row_group, row| {
+                    (0..col_count)
+                        .map(|idx| row_group.column(idx).value_at(row))
+                        .collect()
+                },
+            )
+        })?;
 
         apply_order_by_and_limit(&mut rows, &columns, plan.order_by.as_ref(), plan.limit)?;
         Ok(QueryResult { columns, rows })
@@ -630,27 +698,31 @@ impl DbInner {
         let required_columns =
             required_column_indexes(table.schema.columns.len(), &filters, &projections, &[]);
         let mapped = self.storage.mapped_bytes();
+        let query_threads = self.query_runtime.threads;
 
-        let mut rows = parallel_scan_table(
-            table,
-            mapped,
-            &filters,
-            &required_columns,
-            |row_group, row| {
-                projections
-                    .iter()
-                    .map(|proj| match &proj.expr {
-                        CompiledProjectionExpr::Column { column_index, .. } => {
-                            row_group.column(*column_index).value_at(row)
-                        }
-                        CompiledProjectionExpr::Scalar(scalar) => {
-                            eval_compiled_scalar(scalar, row_group, row).unwrap_or(Value::Null)
-                        }
-                        CompiledProjectionExpr::Aggregate { .. } => unreachable!(),
-                    })
-                    .collect()
-            },
-        )?;
+        let mut rows = self.query_runtime.pool.install(|| {
+            parallel_scan_table(
+                table,
+                query_threads,
+                mapped,
+                &filters,
+                &required_columns,
+                |row_group, row| {
+                    projections
+                        .iter()
+                        .map(|proj| match &proj.expr {
+                            CompiledProjectionExpr::Column { column_index, .. } => {
+                                row_group.column(*column_index).value_at(row)
+                            }
+                            CompiledProjectionExpr::Scalar(scalar) => {
+                                eval_compiled_scalar(scalar, row_group, row).unwrap_or(Value::Null)
+                            }
+                            CompiledProjectionExpr::Aggregate { .. } => unreachable!(),
+                        })
+                        .collect()
+                },
+            )
+        })?;
 
         apply_order_by_and_limit(&mut rows, &columns, plan.order_by.as_ref(), plan.limit)?;
         Ok(QueryResult { columns, rows })
@@ -675,15 +747,45 @@ impl DbInner {
             &group_indexes,
         );
         let mapped = self.storage.mapped_bytes();
+        let query_threads = self.query_runtime.threads;
+        let parallelize_rows = query_threads > 1 && table.row_groups.len() < query_threads;
+
+        if let Some(fast_path) =
+            classify_fast_grouped_count(table, plan, &projections, &group_indexes)
+        {
+            return self.select_fast_grouped_count(
+                table,
+                plan,
+                &filters,
+                &projections,
+                &columns,
+                &required_columns,
+                mapped,
+                query_threads,
+                parallelize_rows,
+                fast_path,
+            );
+        }
 
         let mut rows = if group_indexes.is_empty() {
-            let partials = collect_row_group_aggregates(
-                table,
-                mapped,
-                &filters,
-                &required_columns,
-                |row_group| aggregate_row_group_all(row_group, &filters, &projections),
-            )?;
+            let partials = self.query_runtime.pool.install(|| {
+                collect_row_group_aggregates(
+                    table,
+                    query_threads,
+                    mapped,
+                    &filters,
+                    &required_columns,
+                    |row_group| {
+                        aggregate_row_group_all(
+                            row_group,
+                            &filters,
+                            &projections,
+                            query_threads,
+                            parallelize_rows,
+                        )
+                    },
+                )
+            })?;
             let mut states = projections.iter().map(AggState::new).collect::<Vec<_>>();
             let mut saw_row = false;
 
@@ -703,15 +805,25 @@ impl DbInner {
 
             vec![build_output_row(&projections, &[], states)?]
         } else {
-            let partials = collect_row_group_aggregates(
-                table,
-                mapped,
-                &filters,
-                &required_columns,
-                |row_group| {
-                    aggregate_row_group_grouped(row_group, &filters, &projections, &group_indexes)
-                },
-            )?;
+            let partials = self.query_runtime.pool.install(|| {
+                collect_row_group_aggregates(
+                    table,
+                    query_threads,
+                    mapped,
+                    &filters,
+                    &required_columns,
+                    |row_group| {
+                        aggregate_row_group_grouped(
+                            row_group,
+                            &filters,
+                            &projections,
+                            &group_indexes,
+                            query_threads,
+                            parallelize_rows,
+                        )
+                    },
+                )
+            })?;
             let mut global_groups: FxHashMap<Vec<Value>, Vec<AggState>> = FxHashMap::default();
 
             for partial in partials {
@@ -733,6 +845,92 @@ impl DbInner {
 
         apply_order_by_and_limit(&mut rows, &columns, plan.order_by.as_ref(), plan.limit)?;
         Ok(QueryResult { columns, rows })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn select_fast_grouped_count(
+        &self,
+        table: &Table,
+        plan: &SelectPlan,
+        filters: &[compile::CompiledFilter],
+        projections: &[CompiledProjection],
+        columns: &[String],
+        required_columns: &[usize],
+        mapped: Option<&[u8]>,
+        query_threads: usize,
+        parallelize_rows: bool,
+        fast_path: FastGroupedCountPlan,
+    ) -> Result<QueryResult> {
+        let mut rows = match fast_path.key_type {
+            FastGroupedCountKeyType::Int64 => {
+                let partials = self.query_runtime.pool.install(|| {
+                    collect_row_group_aggregates(
+                        table,
+                        query_threads,
+                        mapped,
+                        filters,
+                        required_columns,
+                        |row_group| {
+                            count_row_group_int64(
+                                row_group,
+                                filters,
+                                fast_path.key_index,
+                                query_threads,
+                                parallelize_rows,
+                            )
+                        },
+                    )
+                })?;
+
+                let mut counts = FxHashMap::default();
+                for partial in partials {
+                    for (key, count) in partial {
+                        *counts.entry(key).or_insert(0) += count;
+                    }
+                }
+
+                materialize_int64_grouped_counts(
+                    counts,
+                    projections,
+                    fast_path.order_by_count_desc,
+                    plan.limit,
+                )?
+            }
+            FastGroupedCountKeyType::Bool => {
+                let partials = self.query_runtime.pool.install(|| {
+                    collect_row_group_aggregates(
+                        table,
+                        query_threads,
+                        mapped,
+                        filters,
+                        required_columns,
+                        |row_group| count_row_group_bool(row_group, filters, fast_path.key_index),
+                    )
+                })?;
+
+                let mut counts = [0_i64; 2];
+                for partial in partials {
+                    counts[0] += partial[0];
+                    counts[1] += partial[1];
+                }
+
+                materialize_bool_grouped_counts(
+                    counts,
+                    projections,
+                    fast_path.order_by_count_desc,
+                    plan.limit,
+                )?
+            }
+        };
+
+        if !(fast_path.order_by_count_desc && plan.limit.is_some()) {
+            apply_order_by_and_limit(&mut rows, columns, plan.order_by.as_ref(), plan.limit)?;
+        }
+
+        Ok(QueryResult {
+            columns: columns.to_vec(),
+            rows,
+        })
     }
 }
 
@@ -758,6 +956,133 @@ fn build_output_row(
                 bail!("scalar expressions in aggregate queries are not yet supported")
             }
             CompiledProjectionExpr::Aggregate { .. } => row.push(state.finish()?),
+        }
+    }
+    Ok(row)
+}
+
+fn classify_fast_grouped_count(
+    table: &Table,
+    plan: &SelectPlan,
+    projections: &[CompiledProjection],
+    group_indexes: &[usize],
+) -> Option<FastGroupedCountPlan> {
+    if group_indexes.len() != 1 {
+        return None;
+    }
+
+    let key_index = group_indexes[0];
+    let key_type = match table.schema.columns[key_index].data_type {
+        DataType::Int64 | DataType::Timestamp => FastGroupedCountKeyType::Int64,
+        DataType::Bool => FastGroupedCountKeyType::Bool,
+        _ => return None,
+    };
+
+    let mut saw_key = false;
+    let mut count_aliases = Vec::new();
+    for projection in projections {
+        match &projection.expr {
+            CompiledProjectionExpr::Column {
+                column_index,
+                group_key_index,
+            } if *column_index == key_index && *group_key_index == Some(0) => {
+                saw_key = true;
+            }
+            CompiledProjectionExpr::Aggregate {
+                kind: AggregateKind::Count,
+                column_index: None,
+            } => count_aliases.push(projection.alias.clone()),
+            _ => return None,
+        }
+    }
+
+    if !saw_key || count_aliases.is_empty() {
+        return None;
+    }
+
+    let order_by_count_desc = plan.order_by.as_ref().is_some_and(|order_by| {
+        order_by.descending && count_aliases.iter().any(|alias| alias == &order_by.field)
+    });
+
+    Some(FastGroupedCountPlan {
+        key_index,
+        key_type,
+        order_by_count_desc,
+    })
+}
+
+fn materialize_int64_grouped_counts(
+    counts: FxHashMap<i64, i64>,
+    projections: &[CompiledProjection],
+    order_by_count_desc: bool,
+    limit: Option<usize>,
+) -> Result<Vec<Vec<Value>>> {
+    let mut entries = counts.into_iter().collect::<Vec<_>>();
+    if order_by_count_desc {
+        sort_and_limit_grouped_counts(&mut entries, limit);
+    }
+
+    entries
+        .into_iter()
+        .map(|(key, count)| build_fast_grouped_count_row(projections, Value::Int64(key), count))
+        .collect()
+}
+
+fn materialize_bool_grouped_counts(
+    counts: [i64; 2],
+    projections: &[CompiledProjection],
+    order_by_count_desc: bool,
+    limit: Option<usize>,
+) -> Result<Vec<Vec<Value>>> {
+    let mut entries = Vec::new();
+    if counts[0] > 0 {
+        entries.push((false, counts[0]));
+    }
+    if counts[1] > 0 {
+        entries.push((true, counts[1]));
+    }
+    if order_by_count_desc {
+        sort_and_limit_grouped_counts(&mut entries, limit);
+    }
+
+    entries
+        .into_iter()
+        .map(|(key, count)| build_fast_grouped_count_row(projections, Value::Bool(key), count))
+        .collect()
+}
+
+fn sort_and_limit_grouped_counts<K>(entries: &mut Vec<(K, i64)>, limit: Option<usize>) {
+    if let Some(limit) = limit
+        && limit < entries.len()
+    {
+        entries.select_nth_unstable_by(limit, |lhs, rhs| rhs.1.cmp(&lhs.1));
+        entries.truncate(limit);
+    }
+    entries.sort_unstable_by(|lhs, rhs| rhs.1.cmp(&lhs.1));
+}
+
+fn build_fast_grouped_count_row(
+    projections: &[CompiledProjection],
+    key: Value,
+    count: i64,
+) -> Result<Vec<Value>> {
+    let mut row = Vec::with_capacity(projections.len());
+    for projection in projections {
+        match &projection.expr {
+            CompiledProjectionExpr::Column {
+                group_key_index, ..
+            } => {
+                ensure!(
+                    *group_key_index == Some(0),
+                    "invalid grouped count fast path key projection"
+                );
+                row.push(key.clone());
+            }
+            CompiledProjectionExpr::Aggregate {
+                kind: AggregateKind::Count,
+                column_index: None,
+            } => row.push(Value::Int64(count)),
+            _ => bail!("invalid grouped count fast path projection"),
         }
     }
     Ok(row)
@@ -1090,6 +1415,114 @@ mod tests {
     }
 
     #[test]
+    fn multi_filter_queries_match_expected_rows() -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "narrowdb-test-multifilter-{}.db",
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        ));
+
+        let db = NarrowDb::open(&path, DbOptions::default())?;
+        db.execute_sql(
+            "CREATE TABLE logs (id INT, level TEXT, status INT, duration REAL);
+             INSERT INTO logs VALUES
+                 (1, 'info', 200, 10.0),
+                 (2, 'error', 500, 650.0),
+                 (3, 'error', 503, 750.0),
+                 (4, 'warn', 503, 900.0),
+                 (5, 'error', 504, 800.0);",
+        )?;
+
+        let results = db.execute_sql(
+            "SELECT id FROM logs
+             WHERE level = 'error' AND status >= 503 AND duration >= 750.0
+             ORDER BY id;",
+        )?;
+        let result = results.last().unwrap();
+        assert_eq!(
+            result.rows,
+            vec![vec![Value::Int64(3)], vec![Value::Int64(5)]]
+        );
+
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn grouped_string_queries_merge_across_row_groups() -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "narrowdb-test-group-merge-{}.db",
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        ));
+
+        let db = NarrowDb::open(
+            &path,
+            DbOptions {
+                row_group_size: 2,
+                sync_on_flush: true,
+                ..DbOptions::default()
+            },
+        )?;
+        db.execute_sql(
+            "CREATE TABLE logs (service TEXT, status INT);
+             INSERT INTO logs VALUES
+                 ('api', 200),
+                 ('worker', 500),
+                 ('worker', 503),
+                 ('api', 500);",
+        )?;
+        db.flush_all()?;
+
+        let results = db.execute_sql(
+            "SELECT service, COUNT(*) AS total
+             FROM logs
+             GROUP BY service
+             ORDER BY service;",
+        )?;
+        let result = results.last().unwrap();
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![Value::String("api".to_string()), Value::Int64(2)],
+                vec![Value::String("worker".to_string()), Value::Int64(2)],
+            ]
+        );
+
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn aggregates_ignore_nulls_for_min_and_max() -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "narrowdb-test-null-agg-{}.db",
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        ));
+
+        let db = NarrowDb::open(&path, DbOptions::default())?;
+        db.execute_sql(
+            "CREATE TABLE metrics (service TEXT, duration REAL, status INT);
+             INSERT INTO metrics VALUES
+                 ('api', 10.0, 200),
+                 ('api', NULL, NULL),
+                 ('worker', 25.5, 503),
+                 ('worker', 3.0, 404);",
+        )?;
+
+        let results = db.execute_sql(
+            "SELECT MIN(duration) AS min_duration, MAX(status) AS max_status
+             FROM metrics;",
+        )?;
+        let result = results.last().unwrap();
+        assert_eq!(
+            result.rows,
+            vec![vec![Value::Float64(OrderedFloat(3.0)), Value::Int64(503),]]
+        );
+
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
     fn alters_table_and_column_names() -> Result<()> {
         let path = std::env::temp_dir().join(format!(
             "narrowdb-test-alter-{}.db",
@@ -1176,6 +1609,97 @@ mod tests {
     }
 
     #[test]
+    fn rejects_zero_query_threads() {
+        let path = std::env::temp_dir().join(format!(
+            "narrowdb-test-threads-invalid-{}.db",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock drift")
+                .as_nanos()
+        ));
+
+        let result = NarrowDb::open(
+            &path,
+            DbOptions {
+                query_threads: Some(0),
+                ..DbOptions::default()
+            },
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn reuses_query_thread_pool_for_identical_sizes() -> Result<()> {
+        let runtime_a = QueryRuntime::new(Some(2))?;
+        let runtime_b = QueryRuntime::new(Some(2))?;
+        assert_eq!(runtime_a.threads, 2);
+        assert!(Arc::ptr_eq(&runtime_a.pool, &runtime_b.pool));
+        Ok(())
+    }
+
+    #[test]
+    fn query_results_match_between_single_and_multi_thread_execution() -> Result<()> {
+        let base = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let path_single = std::env::temp_dir().join(format!("narrowdb-test-single-{base}.db"));
+        let path_multi = std::env::temp_dir().join(format!("narrowdb-test-multi-{base}.db"));
+        let query = "SELECT service, COUNT(*) AS total
+                     FROM logs
+                     WHERE status >= 500
+                     GROUP BY service
+                     ORDER BY service;";
+
+        let single = seeded_query_db(&path_single, Some(1))?;
+        let multi = seeded_query_db(&path_multi, Some(4))?;
+
+        let single_result = single.execute_sql(query)?.pop().unwrap();
+        let multi_result = multi.execute_sql(query)?.pop().unwrap();
+        assert_eq!(single_result.columns, multi_result.columns);
+        assert_eq!(single_result.rows, multi_result.rows);
+
+        std::fs::remove_file(path_single)?;
+        std::fs::remove_file(path_multi)?;
+        Ok(())
+    }
+
+    #[test]
+    fn preserves_row_order_with_parallel_row_materialization() -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "narrowdb-test-row-order-{}.db",
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        ));
+        let db = NarrowDb::open(
+            &path,
+            DbOptions {
+                row_group_size: 131_072,
+                query_threads: Some(4),
+                ..DbOptions::default()
+            },
+        )?;
+        db.execute_sql("CREATE TABLE logs (id INT, service TEXT, status INT);")?;
+
+        let rows = 70_000;
+        let batch = ColumnarBatch::new(vec![
+            BatchColumn::Int64((0..rows).map(|value| value as i64).collect()),
+            BatchColumn::String((0..rows).map(|_| "api".to_string()).collect()),
+            BatchColumn::Int64((0..rows).map(|_| 500_i64).collect()),
+        ])?;
+        db.insert_columnar_batch("logs", batch)?;
+        db.flush_all()?;
+
+        let result = db
+            .execute_sql("SELECT id FROM logs WHERE status >= 500;")?
+            .pop()
+            .unwrap();
+        assert_eq!(result.rows.len(), rows);
+        for (index, row) in result.rows.iter().enumerate() {
+            assert_eq!(row, &vec![Value::Int64(index as i64)]);
+        }
+
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
     fn describe_table_returns_schema() -> Result<()> {
         let path = std::env::temp_dir().join(format!(
             "narrowdb-test-describe-{}.db",
@@ -1213,5 +1737,175 @@ mod tests {
 
         std::fs::remove_file(path)?;
         Ok(())
+    }
+
+    #[test]
+    fn fast_grouped_count_returns_expected_top_k_for_int_keys() -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "narrowdb-test-fast-grouped-count-{}.db",
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        ));
+        let db = NarrowDb::open(
+            &path,
+            DbOptions {
+                row_group_size: 8,
+                query_threads: Some(4),
+                ..DbOptions::default()
+            },
+        )?;
+        db.execute_sql("CREATE TABLE logs (request_id INT, status INT);")?;
+        db.execute_sql(
+            "INSERT INTO logs VALUES
+                (1, 500), (1, 500), (1, 500), (1, 500), (1, 500),
+                (2, 500), (2, 500), (2, 500), (2, 500),
+                (3, 500), (3, 500), (3, 500),
+                (4, 500), (4, 500);",
+        )?;
+
+        let result = db
+            .execute_sql(
+                "SELECT request_id, COUNT(*) AS total
+                 FROM logs
+                 WHERE status >= 500
+                 GROUP BY request_id
+                 ORDER BY total DESC
+                 LIMIT 2;",
+            )?
+            .pop()
+            .unwrap();
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![Value::Int64(1), Value::Int64(5)],
+                vec![Value::Int64(2), Value::Int64(4)],
+            ]
+        );
+
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn fast_grouped_count_accepts_arbitrary_ties_for_top_k() -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "narrowdb-test-fast-grouped-ties-{}.db",
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        ));
+        let db = NarrowDb::open(
+            &path,
+            DbOptions {
+                row_group_size: 32,
+                query_threads: Some(4),
+                ..DbOptions::default()
+            },
+        )?;
+        db.execute_sql("CREATE TABLE logs (request_id INT, status INT);")?;
+        db.insert_columnar_batch(
+            "logs",
+            ColumnarBatch::new(vec![
+                BatchColumn::Int64((0..64).map(|value| value as i64).collect()),
+                BatchColumn::Int64((0..64).map(|_| 500_i64).collect()),
+            ])?,
+        )?;
+        db.flush_all()?;
+
+        let result = db
+            .execute_sql(
+                "SELECT request_id, COUNT(*) AS total
+                 FROM logs
+                 WHERE status >= 500
+                 GROUP BY request_id
+                 ORDER BY total DESC
+                 LIMIT 25;",
+            )?
+            .pop()
+            .unwrap();
+        assert_eq!(result.rows.len(), 25);
+
+        let mut ids = std::collections::BTreeSet::new();
+        for row in &result.rows {
+            assert_eq!(row[1], Value::Int64(1));
+            let request_id = row[0].as_i64().expect("request_id should be int");
+            assert!((0..64).contains(&(request_id as usize)));
+            ids.insert(request_id);
+        }
+        assert_eq!(ids.len(), 25);
+
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn fast_grouped_count_supports_bool_keys() -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "narrowdb-test-fast-grouped-bool-{}.db",
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        ));
+        let db = NarrowDb::open(
+            &path,
+            DbOptions {
+                query_threads: Some(4),
+                ..DbOptions::default()
+            },
+        )?;
+        db.execute_sql("CREATE TABLE logs (is_error BOOL);")?;
+        db.execute_sql(
+            "INSERT INTO logs VALUES
+                (true), (true), (true),
+                (false), (false);",
+        )?;
+
+        let result = db
+            .execute_sql(
+                "SELECT is_error, COUNT(*) AS total
+                 FROM logs
+                 GROUP BY is_error
+                 ORDER BY total DESC;",
+            )?
+            .pop()
+            .unwrap();
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![Value::Bool(true), Value::Int64(3)],
+                vec![Value::Bool(false), Value::Int64(2)],
+            ]
+        );
+
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    fn seeded_query_db(path: &std::path::Path, query_threads: Option<usize>) -> Result<NarrowDb> {
+        let db = NarrowDb::open(
+            path,
+            DbOptions {
+                row_group_size: 16_384,
+                query_threads,
+                ..DbOptions::default()
+            },
+        )?;
+        db.execute_sql("CREATE TABLE logs (service TEXT, status INT);")?;
+        let rows = 80_000;
+        let services = (0..rows)
+            .map(|index| match index % 4 {
+                0 => "api".to_string(),
+                1 => "worker".to_string(),
+                2 => "billing".to_string(),
+                _ => "search".to_string(),
+            })
+            .collect::<Vec<_>>();
+        let statuses = (0..rows)
+            .map(|index| if index % 3 == 0 { 503 } else { 200 })
+            .collect::<Vec<_>>();
+        db.insert_columnar_batch(
+            "logs",
+            ColumnarBatch::new(vec![
+                BatchColumn::String(services),
+                BatchColumn::Int64(statuses),
+            ])?,
+        )?;
+        db.flush_all()?;
+        Ok(db)
     }
 }

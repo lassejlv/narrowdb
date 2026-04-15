@@ -326,6 +326,7 @@ All columns in a batch must have the same number of rows. Column order must matc
 |--------|---------|-------------|
 | `row_group_size` | 16,384 | Rows per row group. Larger values improve compression and query throughput. Benchmark default is 32,768. |
 | `sync_on_flush` | true | Call fsync after each row group flush. Disable for faster ingestion when durability isn't critical. |
+| `query_threads` | auto | Number of query worker threads. `None` uses all available CPU cores. |
 
 ### Server Options
 
@@ -336,6 +337,7 @@ All columns in a batch must have the same number of rows. Column order must matc
 | `--password` | `NARROWDB_PASSWORD` | `narrowdb` | Authentication password |
 | `--row-group-size` | `NARROWDB_ROW_GROUP_SIZE` | `16384` | Rows per row group |
 | `--sync` | `NARROWDB_SYNC` | `true` | Fsync on flush |
+| `--query-threads` | `NARROWDB_QUERY_THREADS` | auto | Number of query worker threads |
 
 ---
 

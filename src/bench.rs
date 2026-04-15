@@ -35,7 +35,11 @@ const MESSAGE_TEMPLATES: [&str; 16] = [
 ];
 const BATCH_SIZE: usize = 65_536;
 
-pub fn run_benchmark(path: impl AsRef<Path>, rows: usize) -> Result<()> {
+pub fn run_benchmark(
+    path: impl AsRef<Path>,
+    rows: usize,
+    query_threads: Option<usize>,
+) -> Result<()> {
     let path = path.as_ref();
     if path.exists() {
         std::fs::remove_file(path)?;
@@ -46,6 +50,7 @@ pub fn run_benchmark(path: impl AsRef<Path>, rows: usize) -> Result<()> {
         DbOptions {
             row_group_size: 32_768,
             sync_on_flush: false,
+            query_threads,
             ..DbOptions::default()
         },
     )?;
@@ -170,7 +175,13 @@ pub fn run_benchmark(path: impl AsRef<Path>, rows: usize) -> Result<()> {
 
     drop(db);
     let reopen_started = Instant::now();
-    let db = NarrowDb::open(path, DbOptions::default())?;
+    let db = NarrowDb::open(
+        path,
+        DbOptions {
+            query_threads,
+            ..DbOptions::default()
+        },
+    )?;
     let reopen_elapsed = reopen_started.elapsed();
     println!("Reopen time: {:?}", reopen_elapsed);
     run_query_benchmark(

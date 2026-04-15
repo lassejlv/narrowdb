@@ -34,6 +34,7 @@ pub struct DbOptions {
     pub row_group_size: usize,
     pub sync_on_flush: bool,
     pub auto_flush_interval: Option<Duration>,
+    pub query_threads: Option<usize>,
 }
 
 impl Default for DbOptions {
@@ -42,6 +43,7 @@ impl Default for DbOptions {
             row_group_size: 16_384,
             sync_on_flush: true,
             auto_flush_interval: None,
+            query_threads: None,
         }
     }
 }
@@ -52,7 +54,7 @@ impl Default for DbOptions {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NullBitmap {
-    data: Vec<u8>,
+    words: Vec<u64>,
     len: usize,
 }
 
@@ -67,8 +69,8 @@ impl NullBitmap {
         self.len == 0
     }
 
-    pub fn data(&self) -> &[u8] {
-        &self.data
+    pub fn words(&self) -> &[u64] {
+        &self.words
     }
 
     pub fn is_null(&self, index: usize) -> bool {
@@ -77,31 +79,63 @@ impl NullBitmap {
 
     pub fn is_present(&self, index: usize) -> bool {
         debug_assert!(index < self.len);
-        (self.data[index / 8] >> (index % 8)) & 1 != 0
+        let word = self.words[index / 64];
+        ((word >> (index % 64)) & 1) != 0
     }
 
     pub fn from_bools(present: &[bool]) -> Self {
         let len = present.len();
-        let byte_len = (len + 7) / 8;
-        let mut data = vec![0u8; byte_len];
+        let word_len = len.div_ceil(64);
+        let mut words = vec![0u64; word_len];
         for (i, &p) in present.iter().enumerate() {
             if p {
-                data[i / 8] |= 1 << (i % 8);
+                words[i / 64] |= 1u64 << (i % 64);
             }
         }
-        Self { data, len }
+        Self { words, len }
     }
 
     pub fn null_count(&self) -> usize {
-        (0..self.len).filter(|&i| self.is_null(i)).count()
+        self.len
+            - self
+                .words
+                .iter()
+                .map(|word| word.count_ones() as usize)
+                .sum::<usize>()
     }
 
     fn encode(&self) -> Vec<u8> {
-        self.data.clone()
+        let byte_len = self.len.div_ceil(8);
+        let mut encoded = Vec::with_capacity(byte_len);
+        for word in &self.words {
+            if encoded.len() >= byte_len {
+                break;
+            }
+            let remaining = byte_len - encoded.len();
+            let bytes = word.to_le_bytes();
+            encoded.extend_from_slice(&bytes[..remaining.min(bytes.len())]);
+        }
+        encoded
     }
 
     fn decode(data: Vec<u8>, len: usize) -> Self {
-        Self { data, len }
+        let word_len = len.div_ceil(64);
+        let mut words = vec![0u64; word_len];
+        for (word_idx, chunk) in data.chunks(8).enumerate() {
+            let mut bytes = [0u8; 8];
+            bytes[..chunk.len()].copy_from_slice(chunk);
+            words[word_idx] = u64::from_le_bytes(bytes);
+        }
+        let mut bitmap = Self { words, len };
+        bitmap.clear_unused_bits();
+        bitmap
+    }
+
+    fn clear_unused_bits(&mut self) {
+        let remainder = self.len % 64;
+        if remainder > 0 && !self.words.is_empty() {
+            *self.words.last_mut().unwrap() &= (1u64 << remainder) - 1;
+        }
     }
 }
 
@@ -261,14 +295,6 @@ impl ColumnData {
                     .as_str()
                     .cmp(target.as_str()),
             ),
-            _ => None,
-        }
-    }
-
-    pub fn numeric_at(&self, row: usize) -> Option<f64> {
-        match self {
-            Self::Int64(values) => Some(values[row] as f64),
-            Self::Float64(values) => Some(values[row].into_inner()),
             _ => None,
         }
     }

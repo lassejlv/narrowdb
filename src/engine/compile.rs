@@ -87,13 +87,20 @@ pub(super) fn compile_filters(schema: &Schema, filters: &[Filter]) -> Result<Vec
     Ok(compiled)
 }
 
-fn filter_priority(filter: &CompiledFilter) -> u8 {
-    match filter.op {
-        CompareOp::Eq => 0,
-        CompareOp::Gt | CompareOp::Gte | CompareOp::Lt | CompareOp::Lte => 1,
-        CompareOp::NotEq => 2,
+fn filter_priority(filter: &CompiledFilter) -> (u8, u8) {
+    let op_priority = match filter.op {
         CompareOp::IsNull | CompareOp::IsNotNull => 0,
-    }
+        CompareOp::Eq => 1,
+        CompareOp::Gt | CompareOp::Gte | CompareOp::Lt | CompareOp::Lte => 2,
+        CompareOp::NotEq => 3,
+    };
+    let value_priority = match filter.value {
+        Value::Bool(_) => 0,
+        Value::Int64(_) | Value::Float64(_) => 1,
+        Value::String(_) => 2,
+        Value::Null => 0,
+    };
+    (op_priority, value_priority)
 }
 
 pub(super) fn compile_projections(

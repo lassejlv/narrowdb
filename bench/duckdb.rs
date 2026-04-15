@@ -7,7 +7,8 @@ const DB_PATH: &str = "/tmp/bench-duckdb.db";
 const BATCH_SIZE: usize = 65_536;
 
 fn main() -> Result<()> {
-    let rows = common::row_count_from_args();
+    let args = common::benchmark_args()?;
+    let rows = args.rows;
     common::print_header("DuckDB", rows);
 
     if std::path::Path::new(DB_PATH).exists() {
@@ -15,6 +16,8 @@ fn main() -> Result<()> {
     }
 
     let conn = Connection::open(DB_PATH)?;
+    let query_threads = common::resolved_query_threads(args.query_threads);
+    conn.execute_batch(&format!("PRAGMA threads = {query_threads};"))?;
 
     conn.execute_batch(
         "CREATE TABLE logs (
