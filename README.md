@@ -28,7 +28,7 @@ narrowdb exec logs.db "DESCRIBE app_logs;"
 
 ```toml
 [dependencies]
-narrowdb = "0.1"
+narrowdb = "0.3.1"
 ```
 
 ```rust
