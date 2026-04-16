@@ -96,36 +96,12 @@ pub fn generate_row(i: usize) -> Row {
 pub struct BenchmarkArgs {
     pub rows: usize,
     pub query_threads: Option<usize>,
+    #[allow(dead_code)]
+    pub repeat: usize,
 }
 
 pub fn benchmark_args() -> Result<BenchmarkArgs> {
-    let mut rows = None;
-    let mut query_threads = None;
-    let mut args = std::env::args().skip(1);
-
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--query-threads" => {
-                let value = args.next().context("missing value for --query-threads")?;
-                let threads = value
-                    .parse::<usize>()
-                    .context("query threads must be an integer")?;
-                if threads == 0 {
-                    bail!("query threads must be greater than zero");
-                }
-                query_threads = Some(threads);
-            }
-            value if rows.is_none() => {
-                rows = Some(value.parse::<usize>().context("rows must be an integer")?);
-            }
-            other => bail!("unknown argument: {other}"),
-        }
-    }
-
-    Ok(BenchmarkArgs {
-        rows: rows.unwrap_or(1_000_000),
-        query_threads,
-    })
+    parse_benchmark_args(std::env::args().skip(1))
 }
 
 pub fn resolved_query_threads(query_threads: Option<usize>) -> usize {
@@ -182,11 +158,13 @@ pub struct QueryResult {
     pub rows: Vec<Vec<String>>,
 }
 
+#[allow(dead_code)]
 pub struct QueryMetric {
     pub label: &'static str,
     pub elapsed: Duration,
 }
 
+#[allow(dead_code)]
 pub struct BenchmarkReport {
     pub engine: &'static str,
     pub rows: usize,
@@ -196,6 +174,7 @@ pub struct BenchmarkReport {
     pub queries: Vec<QueryMetric>,
 }
 
+#[allow(dead_code)]
 impl BenchmarkReport {
     pub fn ingest_throughput(&self) -> f64 {
         self.rows as f64 / self.ingest_elapsed.as_secs_f64()
@@ -206,6 +185,7 @@ impl BenchmarkReport {
     }
 }
 
+#[allow(dead_code)]
 pub fn print_comparison(narrow: &BenchmarkReport, duckdb: &BenchmarkReport) {
     println!("{} vs {}", narrow.engine, duckdb.engine);
     println!(
@@ -273,6 +253,45 @@ pub fn print_comparison(narrow: &BenchmarkReport, duckdb: &BenchmarkReport) {
     );
 }
 
+#[allow(dead_code)]
+pub fn median_report(reports: &[BenchmarkReport]) -> Result<BenchmarkReport> {
+    let first = reports.first().context("no benchmark reports collected")?;
+    let mut ingest_samples = reports
+        .iter()
+        .map(|report| report.ingest_elapsed)
+        .collect::<Vec<_>>();
+    ingest_samples.sort_unstable();
+
+    let mut file_sizes = reports
+        .iter()
+        .map(|report| report.file_size)
+        .collect::<Vec<_>>();
+    file_sizes.sort_unstable();
+
+    let mut query_elapsed = Vec::with_capacity(first.queries.len());
+    for query_index in 0..first.queries.len() {
+        let mut samples = reports
+            .iter()
+            .map(|report| report.queries[query_index].elapsed)
+            .collect::<Vec<_>>();
+        samples.sort_unstable();
+        query_elapsed.push(QueryMetric {
+            label: first.queries[query_index].label,
+            elapsed: median_duration(&samples),
+        });
+    }
+
+    Ok(BenchmarkReport {
+        engine: first.engine,
+        rows: first.rows,
+        query_threads: first.query_threads,
+        ingest_elapsed: median_duration(&ingest_samples),
+        file_size: file_sizes[file_sizes.len() / 2],
+        queries: query_elapsed,
+    })
+}
+
+#[allow(dead_code)]
 fn comparison_row(
     metric: impl Into<String>,
     narrow: impl Into<String>,
@@ -288,6 +307,7 @@ fn comparison_row(
     ]
 }
 
+#[allow(dead_code)]
 fn compare_higher_better(lhs: f64, rhs: f64, suffix: &str) -> (String, String) {
     if approx_equal(lhs, rhs) {
         return ("Tie".to_string(), "-".to_string());
@@ -302,6 +322,7 @@ fn compare_higher_better(lhs: f64, rhs: f64, suffix: &str) -> (String, String) {
     }
 }
 
+#[allow(dead_code)]
 fn compare_lower_better(lhs: f64, rhs: f64, suffix: &str) -> (String, String) {
     if approx_equal(lhs, rhs) {
         return ("Tie".to_string(), "-".to_string());
@@ -316,10 +337,12 @@ fn compare_lower_better(lhs: f64, rhs: f64, suffix: &str) -> (String, String) {
     }
 }
 
+#[allow(dead_code)]
 fn approx_equal(lhs: f64, rhs: f64) -> bool {
     (lhs - rhs).abs() < 1e-9
 }
 
+#[allow(dead_code)]
 fn format_duration(duration: Duration) -> String {
     if duration.as_secs() >= 1 {
         format!("{:.3}s", duration.as_secs_f64())
@@ -330,6 +353,7 @@ fn format_duration(duration: Duration) -> String {
     }
 }
 
+#[allow(dead_code)]
 fn render_table<const N: usize>(headers: [&str; N], rows: Vec<Vec<String>>) -> String {
     let mut widths = headers.map(str::len);
     for row in &rows {
@@ -365,6 +389,7 @@ fn render_table<const N: usize>(headers: [&str; N], rows: Vec<Vec<String>>) -> S
     out
 }
 
+#[allow(dead_code)]
 fn render_row(row: &[String], widths: &[usize]) -> String {
     let mut line = String::from("|");
     for (cell, width) in row.iter().zip(widths.iter()) {
@@ -374,4 +399,80 @@ fn render_row(row: &[String], widths: &[usize]) -> String {
         line.push('|');
     }
     line
+}
+
+fn parse_benchmark_args<I>(args: I) -> Result<BenchmarkArgs>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut rows = None;
+    let mut query_threads = None;
+    let mut repeat = 1_usize;
+    let mut args = args.into_iter();
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--query-threads" => {
+                let value = args.next().context("missing value for --query-threads")?;
+                let threads = value
+                    .parse::<usize>()
+                    .context("query threads must be an integer")?;
+                if threads == 0 {
+                    bail!("query threads must be greater than zero");
+                }
+                query_threads = Some(threads);
+            }
+            "--repeat" => {
+                let value = args.next().context("missing value for --repeat")?;
+                repeat = value
+                    .parse::<usize>()
+                    .context("repeat must be an integer")?;
+                if repeat == 0 {
+                    bail!("repeat must be greater than zero");
+                }
+            }
+            value if rows.is_none() => {
+                rows = Some(value.parse::<usize>().context("rows must be an integer")?);
+            }
+            other => bail!("unknown argument: {other}"),
+        }
+    }
+
+    Ok(BenchmarkArgs {
+        rows: rows.unwrap_or(1_000_000),
+        query_threads,
+        repeat,
+    })
+}
+
+#[allow(dead_code)]
+fn median_duration(samples: &[Duration]) -> Duration {
+    samples[samples.len() / 2]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_repeat_and_query_threads() {
+        let args = parse_benchmark_args([
+            "1000".to_string(),
+            "--query-threads".to_string(),
+            "8".to_string(),
+            "--repeat".to_string(),
+            "7".to_string(),
+        ])
+        .expect("benchmark args should parse");
+
+        assert_eq!(args.rows, 1000);
+        assert_eq!(args.query_threads, Some(8));
+        assert_eq!(args.repeat, 7);
+    }
+
+    #[test]
+    fn rejects_zero_repeat() {
+        let result = parse_benchmark_args(["--repeat".to_string(), "0".to_string()]);
+        assert!(result.is_err());
+    }
 }

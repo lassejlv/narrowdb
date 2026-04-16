@@ -4,6 +4,7 @@ mod compile;
 mod scan;
 
 use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
@@ -11,7 +12,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use rayon::{ThreadPool, ThreadPoolBuilder};
+use rayon::{ThreadPool, ThreadPoolBuilder, prelude::ParallelSliceMut};
 use rustc_hash::FxHashMap;
 
 use crate::sql::{
@@ -31,7 +32,8 @@ use compile::{
 };
 use scan::{
     aggregate_row_group_all, aggregate_row_group_grouped, collect_row_group_aggregates,
-    count_row_group_bool, count_row_group_int64, parallel_scan_table,
+    collect_row_group_int64_values, count_row_group_bool, count_row_group_int64,
+    parallel_scan_table,
 };
 
 pub struct NarrowDb {
@@ -64,10 +66,17 @@ enum FastGroupedCountKeyType {
     Bool,
 }
 
+#[derive(Clone, Copy)]
+enum FastGroupedCountMode {
+    Hash,
+    SortedTopK,
+}
+
 struct FastGroupedCountPlan {
     key_index: usize,
     key_type: FastGroupedCountKeyType,
     order_by_count_desc: bool,
+    mode: FastGroupedCountMode,
 }
 
 #[derive(Debug, Clone)]
@@ -862,40 +871,74 @@ impl DbInner {
         fast_path: FastGroupedCountPlan,
     ) -> Result<QueryResult> {
         let mut rows = match fast_path.key_type {
-            FastGroupedCountKeyType::Int64 => {
-                let partials = self.query_runtime.pool.install(|| {
-                    collect_row_group_aggregates(
-                        table,
-                        query_threads,
-                        mapped,
-                        filters,
-                        required_columns,
-                        |row_group| {
-                            count_row_group_int64(
-                                row_group,
-                                filters,
-                                fast_path.key_index,
-                                query_threads,
-                                parallelize_rows,
-                            )
-                        },
-                    )
-                })?;
+            FastGroupedCountKeyType::Int64 => match fast_path.mode {
+                FastGroupedCountMode::Hash => {
+                    let partials = self.query_runtime.pool.install(|| {
+                        collect_row_group_aggregates(
+                            table,
+                            query_threads,
+                            mapped,
+                            filters,
+                            required_columns,
+                            |row_group| {
+                                count_row_group_int64(
+                                    row_group,
+                                    filters,
+                                    fast_path.key_index,
+                                    query_threads,
+                                    parallelize_rows,
+                                )
+                            },
+                        )
+                    })?;
 
-                let mut counts = FxHashMap::default();
-                for partial in partials {
-                    for (key, count) in partial {
-                        *counts.entry(key).or_insert(0) += count;
+                    let mut counts = FxHashMap::default();
+                    for partial in partials {
+                        for (key, count) in partial {
+                            *counts.entry(key).or_insert(0) += count;
+                        }
                     }
-                }
 
-                materialize_int64_grouped_counts(
-                    counts,
-                    projections,
-                    fast_path.order_by_count_desc,
-                    plan.limit,
-                )?
-            }
+                    materialize_int64_grouped_counts(
+                        counts,
+                        projections,
+                        fast_path.order_by_count_desc,
+                        plan.limit,
+                    )?
+                }
+                FastGroupedCountMode::SortedTopK => {
+                    let partials = self.query_runtime.pool.install(|| {
+                        collect_row_group_aggregates(
+                            table,
+                            query_threads,
+                            mapped,
+                            filters,
+                            required_columns,
+                            |row_group| {
+                                collect_row_group_int64_values(
+                                    row_group,
+                                    filters,
+                                    fast_path.key_index,
+                                )
+                            },
+                        )
+                    })?;
+                    let total_keys = partials.iter().map(Vec::len).sum();
+                    let mut keys = Vec::with_capacity(total_keys);
+                    for partial in partials {
+                        keys.extend(partial);
+                    }
+                    self.query_runtime.pool.install(|| {
+                        keys.par_sort_unstable();
+                    });
+
+                    materialize_sorted_topk_grouped_counts(
+                        keys,
+                        projections,
+                        plan.limit.expect("sorted top-k fast path requires LIMIT"),
+                    )?
+                }
+            },
             FastGroupedCountKeyType::Bool => {
                 let partials = self.query_runtime.pool.install(|| {
                     collect_row_group_aggregates(
@@ -1004,10 +1047,20 @@ fn classify_fast_grouped_count(
         order_by.descending && count_aliases.iter().any(|alias| alias == &order_by.field)
     });
 
+    let mode = if matches!(key_type, FastGroupedCountKeyType::Int64)
+        && order_by_count_desc
+        && plan.limit.is_some()
+    {
+        FastGroupedCountMode::SortedTopK
+    } else {
+        FastGroupedCountMode::Hash
+    };
+
     Some(FastGroupedCountPlan {
         key_index,
         key_type,
         order_by_count_desc,
+        mode,
     })
 }
 
@@ -1051,6 +1104,41 @@ fn materialize_bool_grouped_counts(
         .collect()
 }
 
+fn materialize_sorted_topk_grouped_counts(
+    keys: Vec<i64>,
+    projections: &[CompiledProjection],
+    limit: usize,
+) -> Result<Vec<Vec<Value>>> {
+    if keys.is_empty() || limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut heap = BinaryHeap::new();
+    let mut index = 0;
+    while index < keys.len() {
+        let key = keys[index];
+        let mut count = 1_i64;
+        index += 1;
+        while index < keys.len() && keys[index] == key {
+            count += 1;
+            index += 1;
+        }
+        push_top_group_count(&mut heap, limit, key, count);
+    }
+
+    let mut entries = heap
+        .into_sorted_vec()
+        .into_iter()
+        .map(|entry| (entry.0.key, entry.0.count))
+        .collect::<Vec<_>>();
+    entries.sort_unstable_by(|lhs, rhs| rhs.1.cmp(&lhs.1));
+
+    entries
+        .into_iter()
+        .map(|(key, count)| build_fast_grouped_count_row(projections, Value::Int64(key), count))
+        .collect()
+}
+
 fn sort_and_limit_grouped_counts<K>(entries: &mut Vec<(K, i64)>, limit: Option<usize>) {
     if let Some(limit) = limit
         && limit < entries.len()
@@ -1086,6 +1174,46 @@ fn build_fast_grouped_count_row(
         }
     }
     Ok(row)
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct TopGroupCount {
+    count: i64,
+    key: i64,
+}
+
+impl Ord for TopGroupCount {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.count
+            .cmp(&other.count)
+            .then_with(|| self.key.cmp(&other.key))
+    }
+}
+
+impl PartialOrd for TopGroupCount {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn push_top_group_count(
+    heap: &mut BinaryHeap<std::cmp::Reverse<TopGroupCount>>,
+    limit: usize,
+    key: i64,
+    count: i64,
+) {
+    let entry = std::cmp::Reverse(TopGroupCount { count, key });
+    if heap.len() < limit {
+        heap.push(entry);
+        return;
+    }
+
+    if let Some(current_min) = heap.peek()
+        && entry.0.count > current_min.0.count
+    {
+        heap.pop();
+        heap.push(entry);
+    }
 }
 
 fn eval_compiled_scalar(
@@ -1869,6 +1997,51 @@ mod tests {
             vec![
                 vec![Value::Bool(true), Value::Int64(3)],
                 vec![Value::Bool(false), Value::Int64(2)],
+            ]
+        );
+
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn fast_grouped_count_supports_timestamp_keys() -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "narrowdb-test-fast-grouped-timestamp-{}.db",
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        ));
+        let db = NarrowDb::open(
+            &path,
+            DbOptions {
+                row_group_size: 8,
+                query_threads: Some(4),
+                ..DbOptions::default()
+            },
+        )?;
+        db.execute_sql("CREATE TABLE logs (ts TIMESTAMP, status INT);")?;
+        db.execute_sql(
+            "INSERT INTO logs VALUES
+                (100, 500), (100, 500), (100, 500),
+                (200, 500), (200, 500),
+                (300, 500);",
+        )?;
+
+        let result = db
+            .execute_sql(
+                "SELECT ts, COUNT(*) AS total
+                 FROM logs
+                 WHERE status >= 500
+                 GROUP BY ts
+                 ORDER BY total DESC
+                 LIMIT 2;",
+            )?
+            .pop()
+            .unwrap();
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![Value::Int64(100), Value::Int64(3)],
+                vec![Value::Int64(200), Value::Int64(2)],
             ]
         );
 

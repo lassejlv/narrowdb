@@ -255,6 +255,27 @@ pub(super) fn count_row_group_bool(
     Ok(counts)
 }
 
+pub(super) fn collect_row_group_int64_values(
+    row_group: &LoadedRowGroup<'_>,
+    filters: &[CompiledFilter],
+    key_index: usize,
+) -> Result<Vec<i64>> {
+    let selection = select_rows_bitmap(row_group, filters);
+    if selection.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let ColumnData::Int64(values) = row_group.column(key_index) else {
+        bail!("sorted grouped count expects an int64-compatible key column")
+    };
+
+    let mut collected = Vec::with_capacity(selection.count());
+    for row in selection.iter_set() {
+        collected.push(values[row]);
+    }
+    Ok(collected)
+}
+
 fn extract_selected_rows<F>(
     row_group: &LoadedRowGroup<'_>,
     selection: &SelectionBitmap,

@@ -12,9 +12,15 @@ fn main() -> Result<()> {
     let args = common::benchmark_args()?;
     let rows = args.rows;
     let query_threads = common::resolved_query_threads(args.query_threads);
+    let narrow_runs = (0..args.repeat)
+        .map(|_| run_narrow(rows, query_threads))
+        .collect::<Result<Vec<_>>>()?;
+    let duckdb_runs = (0..args.repeat)
+        .map(|_| run_duckdb(rows, query_threads))
+        .collect::<Result<Vec<_>>>()?;
 
-    let narrow = run_narrow(rows, query_threads)?;
-    let duckdb = run_duckdb(rows, query_threads)?;
+    let narrow = common::median_report(&narrow_runs)?;
+    let duckdb = common::median_report(&duckdb_runs)?;
     common::print_comparison(&narrow, &duckdb);
     Ok(())
 }
