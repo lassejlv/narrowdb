@@ -1,6 +1,9 @@
 name: Publish @narrowdb/node
 
 on:
+  push:
+    tags:
+      - "v*"
   workflow_dispatch:
 
 permissions:
@@ -34,6 +37,7 @@ jobs:
           node-version: 22
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.94.1
           targets: ${{ matrix.target }}
 
       - name: Install cross-compiler

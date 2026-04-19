@@ -68,9 +68,9 @@ pub struct Row {
 }
 
 pub fn generate_row(i: usize) -> Row {
-    let level = if i % 17 == 0 {
+    let level = if i.is_multiple_of(17) {
         LEVELS[2]
-    } else if i % 7 == 0 {
+    } else if i.is_multiple_of(7) {
         LEVELS[1]
     } else {
         LEVELS[0]

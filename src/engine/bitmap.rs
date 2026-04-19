@@ -2,6 +2,7 @@ use crate::storage::NullBitmap;
 
 /// Packed bit-vector: bit set = row selected.
 /// Uses u64 words for wide SIMD-friendly operations.
+#[derive(Clone)]
 pub(super) struct SelectionBitmap {
     words: Vec<u64>,
     len: usize,
@@ -11,7 +12,7 @@ pub(super) struct SelectionBitmap {
 impl SelectionBitmap {
     /// All rows selected.
     pub fn all(len: usize) -> Self {
-        let word_count = (len + 63) / 64;
+        let word_count = len.div_ceil(64);
         let mut words = vec![u64::MAX; word_count];
         // Clear unused trailing bits in the last word.
         let remainder = len % 64;
@@ -27,7 +28,7 @@ impl SelectionBitmap {
 
     /// No rows selected.
     pub fn none(len: usize) -> Self {
-        let word_count = (len + 63) / 64;
+        let word_count = len.div_ceil(64);
         Self {
             words: vec![0u64; word_count],
             len,
@@ -48,13 +49,21 @@ impl SelectionBitmap {
         self.len
     }
 
-    #[cfg(test)]
     /// Intersect in-place: self &= other.
     pub fn intersect(&mut self, other: &SelectionBitmap) {
         debug_assert_eq!(self.len, other.len);
         for (a, b) in self.words.iter_mut().zip(other.words.iter()) {
             *a &= *b;
         }
+        self.recount();
+    }
+
+    pub fn union(&mut self, other: &SelectionBitmap) {
+        debug_assert_eq!(self.len, other.len);
+        for (a, b) in self.words.iter_mut().zip(other.words.iter()) {
+            *a |= *b;
+        }
+        self.clear_unused_bits();
         self.recount();
     }
 

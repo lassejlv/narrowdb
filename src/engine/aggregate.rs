@@ -148,24 +148,22 @@ impl AggState {
                 Ok(())
             }
             (Self::Min(lhs), Self::Min(rhs)) => {
-                if let Some(rhs) = rhs {
-                    if lhs
+                if let Some(rhs) = rhs
+                    && lhs
                         .as_ref()
                         .is_none_or(|existing| rhs.compare(existing) == Some(Ordering::Less))
-                    {
-                        *lhs = Some(rhs);
-                    }
+                {
+                    *lhs = Some(rhs);
                 }
                 Ok(())
             }
             (Self::Max(lhs), Self::Max(rhs)) => {
-                if let Some(rhs) = rhs {
-                    if lhs
+                if let Some(rhs) = rhs
+                    && lhs
                         .as_ref()
                         .is_none_or(|existing| rhs.compare(existing) == Some(Ordering::Greater))
-                    {
-                        *lhs = Some(rhs);
-                    }
+                {
+                    *lhs = Some(rhs);
                 }
                 Ok(())
             }

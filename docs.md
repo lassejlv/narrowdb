@@ -20,7 +20,7 @@
 
 ```toml
 [dependencies]
-narrowdb = "0.2"
+narrowdb = "0.3.1"
 ```
 
 ### From source
@@ -111,22 +111,94 @@ db.insert_row("logs", vec![
 ])?;
 ```
 
+### Streaming row ingestion
+
+Use `insert_rows_iter` when your upstream source is naturally row-oriented but you do not want to allocate one giant `Vec<Vec<Value>>` first.
+
+```rust
+use narrowdb::{NarrowDb, DbOptions, Value};
+
+let db = NarrowDb::open("my.db", DbOptions::default())?;
+
+let inserted = db.insert_rows_iter(
+    "logs",
+    (0..1_000_000).map(|i| {
+        vec![
+            Value::Int64(1_700_000_000_000 + i),
+            Value::String(if i % 2 == 0 { "api" } else { "worker" }.into()),
+            Value::Int64(if i % 10 == 0 { 500 } else { 200 }),
+        ]
+    }),
+)?;
+
+assert_eq!(inserted, 1_000_000);
+```
+
 ### Columnar batch insertion (high throughput)
 
 ```rust
-use narrowdb::{NarrowDb, DbOptions, ColumnarBatch, BatchColumn};
+use narrowdb::{ColumnarBatchBuilder, DbOptions, NarrowDb};
 
-let mut db = NarrowDb::open("my.db", DbOptions::default())?;
+let db = NarrowDb::open("my.db", DbOptions::default())?;
 
-let batch = ColumnarBatch::new(vec![
-    BatchColumn::Timestamp(vec![1, 2, 3]),
-    BatchColumn::String(vec!["info".into(), "error".into(), "info".into()]),
-    BatchColumn::String(vec!["api".into(), "api".into(), "worker".into()]),
-    BatchColumn::Int64(vec![200, 500, 200]),
-])?;
+let batch = ColumnarBatchBuilder::new()
+    .timestamps([1, 2, 3])
+    .strings(["info", "error", "info"])
+    .strings(["api", "api", "worker"])
+    .int64([200, 500, 200])
+    .build()?;
 
 db.insert_columnar_batch("logs", batch)?;
 ```
+
+### Choosing an ingestion path
+
+- Use `insert_row` for tiny writes and tests.
+- Use `insert_rows_iter` when the source is row-oriented and you want bounded memory usage.
+- Use `insert_columnar_batch` when you can naturally produce whole columns or want the best ingest throughput.
+- Use `row_group_size` to tune flush behavior for your workload, but keep the batch path as the default for serious volume.
+
+### Timestamp-heavy workflows
+
+`TIMESTAMP` values are stored as 64-bit integers. NarrowDB does not currently provide built-in datetime functions, so the best pattern is to ingest:
+
+- a raw event timestamp column, typically epoch milliseconds
+- one or more precomputed bucket columns such as `minute_bucket`, `hour_bucket`, or `day_bucket`
+
+Example schema:
+
+```sql
+CREATE TABLE metrics (
+    ts TIMESTAMP,
+    minute_bucket TIMESTAMP,
+    day_bucket TIMESTAMP,
+    service TEXT,
+    requests INT,
+    errors INT
+);
+```
+
+This lets you express common rollups and retention-oriented scans with simple filters and grouping:
+
+```sql
+SELECT minute_bucket, service, SUM(errors) AS total_errors
+FROM metrics
+WHERE day_bucket = 1699920000000
+GROUP BY minute_bucket, service
+ORDER BY minute_bucket ASC, service ASC;
+```
+
+### Retention and partition-like ergonomics
+
+NarrowDB does not currently implement built-in partitions or retention policies.
+
+The recommended pattern today is:
+
+- precompute a `day_bucket` or `hour_bucket` column for query pruning
+- rotate tables by period when operationally convenient, for example `logs_2026_04_19`
+- drop or archive whole old tables as your retention mechanism
+
+That approach fits the current storage model better than trying to simulate in-place row eviction.
 
 ### Flushing
 
@@ -144,12 +216,14 @@ Pending rows are also flushed automatically before any SELECT query.
 ## TCP Server
 
 The server crate (`crates/server`) exposes a PostgreSQL wire protocol interface.
+It supports simple queries, extended queries, and parameterized prepared statements. MD5 auth should be treated as trusted-network only.
 
 ### Running
 
 ```bash
 cargo run -p narrowdb-server -- ./logs.narrowdb \
     --listen 127.0.0.1:5433 \
+    --query-threads 4 \
     --user narrowdb \
     --password secret
 ```
@@ -158,6 +232,7 @@ Or via environment variables:
 
 ```bash
 NARROWDB_LISTEN=0.0.0.0:5433 \
+NARROWDB_QUERY_THREADS=4 \
 NARROWDB_USER=narrowdb \
 NARROWDB_PASSWORD=secret \
 narrowdb-server ./logs.narrowdb
@@ -235,9 +310,18 @@ SELECT projections
 FROM table_name
 [WHERE filters]
 [GROUP BY columns]
-[ORDER BY column [ASC|DESC]]
+[ORDER BY column [ASC|DESC], ...]
 [LIMIT n];
 ```
+
+### WHERE filters
+
+Supported filter forms:
+
+- Comparison filters: `=`, `<>`, `<`, `<=`, `>`, `>=`
+- Boolean combinations: `AND`, `OR`, nested with parentheses
+- Membership filters: `IN (...)`, `NOT IN (...)`
+- Null filters: `IS NULL`, `IS NOT NULL`
 
 ### Projections
 
@@ -336,7 +420,7 @@ All columns in a batch must have the same number of rows. Column order must matc
 | `--user` | `NARROWDB_USER` | `narrowdb` | Authentication username |
 | `--password` | `NARROWDB_PASSWORD` | `narrowdb` | Authentication password |
 | `--row-group-size` | `NARROWDB_ROW_GROUP_SIZE` | `16384` | Rows per row group |
-| `--sync` | `NARROWDB_SYNC` | `true` | Fsync on flush |
+| `--sync-on-flush` | `NARROWDB_SYNC_ON_FLUSH` | `true` | Fsync on flush |
 | `--query-threads` | `NARROWDB_QUERY_THREADS` | auto | Number of query worker threads |
 
 ---

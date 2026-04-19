@@ -22,15 +22,18 @@ narrowdb-server <db-file> [options]
 | `--listen` | `NARROWDB_LISTEN` | `127.0.0.1:5433` | Address and port to bind |
 | `--row-group-size` | `NARROWDB_ROW_GROUP_SIZE` | `16384` | Rows per columnar row group |
 | `--sync-on-flush` | `NARROWDB_SYNC_ON_FLUSH` | `true` | Fsync data to disk on flush (`true`/`false`) |
+| `--query-threads` | `NARROWDB_QUERY_THREADS` | auto | Number of query worker threads |
 | `--user` | `NARROWDB_USER` | `narrowdb` | Username for PostgreSQL MD5 auth |
 | `--password` | `NARROWDB_PASSWORD` | `narrowdb` | Password for PostgreSQL MD5 auth |
 
 CLI flags take priority over environment variables.
 
+MD5 authentication is intended for trusted/private networks. If you bind beyond loopback, set a non-default password.
+
 ### Example
 
 ```bash
-narrowdb-server ./logs.narrowdb --listen 0.0.0.0:5433 --user admin --password s3cret
+narrowdb-server ./logs.narrowdb --listen 0.0.0.0:5433 --query-threads 4 --user admin --password s3cret
 ```
 
 ## Connecting
@@ -63,6 +66,7 @@ Configure with environment variables:
 
 ```bash
 docker run -v narrowdb-data:/data -p 5433:5433 \
+  -e NARROWDB_QUERY_THREADS=4 \
   -e NARROWDB_USER=admin \
   -e NARROWDB_PASSWORD=s3cret \
   narrowdb-server
@@ -72,5 +76,5 @@ docker run -v narrowdb-data:/data -p 5433:5433 \
 
 - PostgreSQL MD5 password authentication
 - Simple query protocol
-- Extended query protocol (non-parameterized single statements)
-- Parameterized prepared statements are not yet supported
+- Extended query protocol
+- Parameterized prepared statements

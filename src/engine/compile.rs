@@ -2,7 +2,8 @@ use anyhow::{Context, Result};
 use ordered_float::OrderedFloat;
 
 use crate::sql::{
-    AggregateKind, ArithmeticOp, CompareOp, Filter, Projection, ProjectionExpr, ScalarExpr,
+    AggregateKind, ArithmeticOp, CompareOp, Filter, FilterExpr, Projection, ProjectionExpr,
+    ScalarExpr,
 };
 use crate::storage::ColumnData;
 use crate::types::{Schema, Value};
@@ -12,6 +13,13 @@ pub(super) struct CompiledFilter {
     pub(super) column_index: usize,
     pub(super) op: CompareOp,
     pub(super) value: Value,
+}
+
+#[derive(Debug)]
+pub(super) enum CompiledFilterExpr {
+    Predicate(CompiledFilter),
+    And(Vec<CompiledFilterExpr>),
+    Or(Vec<CompiledFilterExpr>),
 }
 
 #[derive(Debug, Clone)]
@@ -66,25 +74,43 @@ impl LocalKeyPart {
     }
 }
 
-pub(super) fn compile_filters(schema: &Schema, filters: &[Filter]) -> Result<Vec<CompiledFilter>> {
-    let mut compiled = filters
-        .iter()
-        .map(|filter| {
-            let column_index = column_index(schema, &filter.column)?;
-            let data_type = schema.columns[column_index].data_type;
-            let value = match filter.value.clone() {
-                Some(v) => Value::cast_for(data_type, v)?,
-                None => Value::Null,
-            };
-            Ok(CompiledFilter {
-                column_index,
-                op: filter.op,
-                value,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    compiled.sort_by_key(filter_priority);
-    Ok(compiled)
+pub(super) fn compile_filter_expr(
+    schema: &Schema,
+    filter: &FilterExpr,
+) -> Result<CompiledFilterExpr> {
+    match filter {
+        FilterExpr::Predicate(filter) => Ok(CompiledFilterExpr::Predicate(compile_filter(
+            schema, filter,
+        )?)),
+        FilterExpr::And(children) => {
+            let mut compiled = children
+                .iter()
+                .map(|child| compile_filter_expr(schema, child))
+                .collect::<Result<Vec<_>>>()?;
+            compiled.sort_by_key(compiled_filter_priority);
+            Ok(CompiledFilterExpr::And(compiled))
+        }
+        FilterExpr::Or(children) => Ok(CompiledFilterExpr::Or(
+            children
+                .iter()
+                .map(|child| compile_filter_expr(schema, child))
+                .collect::<Result<Vec<_>>>()?,
+        )),
+    }
+}
+
+fn compile_filter(schema: &Schema, filter: &Filter) -> Result<CompiledFilter> {
+    let column_index = column_index(schema, &filter.column)?;
+    let data_type = schema.columns[column_index].data_type;
+    let value = match filter.value.clone() {
+        Some(v) => Value::cast_for(data_type, v)?,
+        None => Value::Null,
+    };
+    Ok(CompiledFilter {
+        column_index,
+        op: filter.op,
+        value,
+    })
 }
 
 fn filter_priority(filter: &CompiledFilter) -> (u8, u8) {
@@ -101,6 +127,17 @@ fn filter_priority(filter: &CompiledFilter) -> (u8, u8) {
         Value::Null => 0,
     };
     (op_priority, value_priority)
+}
+
+fn compiled_filter_priority(filter: &CompiledFilterExpr) -> (u8, u8, u8) {
+    match filter {
+        CompiledFilterExpr::Predicate(filter) => {
+            let (a, b) = filter_priority(filter);
+            (0, a, b)
+        }
+        CompiledFilterExpr::And(_) => (1, 0, 0),
+        CompiledFilterExpr::Or(_) => (2, 0, 0),
+    }
 }
 
 pub(super) fn compile_projections(
@@ -147,13 +184,13 @@ pub(super) fn column_index(schema: &Schema, column_name: &str) -> Result<usize> 
 
 pub(super) fn required_column_indexes(
     schema_len: usize,
-    filters: &[CompiledFilter],
+    filter: Option<&CompiledFilterExpr>,
     projections: &[CompiledProjection],
     extra_indexes: &[usize],
 ) -> Vec<usize> {
     let mut required = vec![false; schema_len];
-    for filter in filters {
-        required[filter.column_index] = true;
+    if let Some(filter) = filter {
+        collect_filter_columns(filter, &mut required);
     }
     for projection in projections {
         match &projection.expr {
@@ -176,6 +213,17 @@ pub(super) fn required_column_indexes(
         .enumerate()
         .filter_map(|(index, include)| include.then_some(index))
         .collect()
+}
+
+fn collect_filter_columns(filter: &CompiledFilterExpr, required: &mut [bool]) {
+    match filter {
+        CompiledFilterExpr::Predicate(filter) => required[filter.column_index] = true,
+        CompiledFilterExpr::And(children) | CompiledFilterExpr::Or(children) => {
+            for child in children {
+                collect_filter_columns(child, required);
+            }
+        }
+    }
 }
 
 fn compile_scalar_expr(schema: &Schema, expr: &ScalarExpr) -> Result<CompiledScalarExpr> {

@@ -54,10 +54,28 @@ pub struct ColumnDef {
     pub data_type: DataType,
 }
 
+impl ColumnDef {
+    pub fn new(name: impl Into<String>, data_type: DataType) -> Self {
+        Self {
+            name: name.into(),
+            data_type,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Schema {
     pub table_name: String,
     pub columns: Vec<ColumnDef>,
+}
+
+impl Schema {
+    pub fn new(table_name: impl Into<String>, columns: Vec<ColumnDef>) -> Self {
+        Self {
+            table_name: table_name.into(),
+            columns,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -78,6 +96,10 @@ impl BatchColumn {
             Self::String(values) => values.len(),
             Self::Timestamp(values) => values.len(),
         }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     pub fn data_type(&self) -> DataType {
@@ -189,6 +211,68 @@ impl ColumnarBatch {
     }
 }
 
+#[derive(Debug, Default, Clone)]
+pub struct ColumnarBatchBuilder {
+    columns: Vec<BatchColumn>,
+}
+
+impl ColumnarBatchBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn int64<I>(mut self, values: I) -> Self
+    where
+        I: IntoIterator<Item = i64>,
+    {
+        self.columns
+            .push(BatchColumn::Int64(values.into_iter().collect()));
+        self
+    }
+
+    pub fn float64<I>(mut self, values: I) -> Self
+    where
+        I: IntoIterator<Item = f64>,
+    {
+        self.columns
+            .push(BatchColumn::Float64(values.into_iter().collect()));
+        self
+    }
+
+    pub fn bools<I>(mut self, values: I) -> Self
+    where
+        I: IntoIterator<Item = bool>,
+    {
+        self.columns
+            .push(BatchColumn::Bool(values.into_iter().collect()));
+        self
+    }
+
+    pub fn strings<I, S>(mut self, values: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.columns.push(BatchColumn::String(
+            values.into_iter().map(Into::into).collect(),
+        ));
+        self
+    }
+
+    pub fn timestamps<I>(mut self, values: I) -> Self
+    where
+        I: IntoIterator<Item = i64>,
+    {
+        self.columns
+            .push(BatchColumn::Timestamp(values.into_iter().collect()));
+        self
+    }
+
+    pub fn build(self) -> Result<ColumnarBatch> {
+        ColumnarBatch::new(self.columns)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Value {
     Int64(i64),
@@ -269,5 +353,38 @@ impl fmt::Display for Value {
             Self::String(value) => write!(f, "{value}"),
             Self::Null => write!(f, "NULL"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn columnar_batch_builder_collects_columns() -> Result<()> {
+        let batch = ColumnarBatchBuilder::new()
+            .timestamps([1, 2, 3])
+            .strings(["api", "worker", "api"])
+            .int64([200, 500, 200])
+            .build()?;
+
+        assert_eq!(batch.rows(), 3);
+        assert_eq!(batch.columns().len(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn schema_and_column_helpers_build_expected_shapes() {
+        let schema = Schema::new(
+            "logs",
+            vec![
+                ColumnDef::new("ts", DataType::Timestamp),
+                ColumnDef::new("service", DataType::String),
+            ],
+        );
+
+        assert_eq!(schema.table_name, "logs");
+        assert_eq!(schema.columns.len(), 2);
+        assert_eq!(schema.columns[0].name, "ts");
     }
 }

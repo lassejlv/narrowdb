@@ -72,6 +72,13 @@ pub struct Filter {
     pub value: Option<Value>,
 }
 
+#[derive(Debug, Clone)]
+pub enum FilterExpr {
+    Predicate(Filter),
+    And(Vec<FilterExpr>),
+    Or(Vec<FilterExpr>),
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum AggregateKind {
     Count,
@@ -98,7 +105,7 @@ pub struct Projection {
 }
 
 #[derive(Debug, Clone)]
-pub struct OrderByPlan {
+pub struct OrderByTerm {
     pub field: String,
     pub descending: bool,
 }
@@ -106,10 +113,10 @@ pub struct OrderByPlan {
 #[derive(Debug, Clone)]
 pub struct SelectPlan {
     pub table_name: String,
-    pub filters: Vec<Filter>,
+    pub filter: Option<FilterExpr>,
     pub projections: Vec<Projection>,
     pub group_by: Vec<String>,
-    pub order_by: Option<OrderByPlan>,
+    pub order_by: Vec<OrderByTerm>,
     pub limit: Option<usize>,
 }
 
@@ -306,6 +313,27 @@ fn parse_insert(statement: sqlparser::ast::Insert) -> Result<Command> {
 }
 
 fn parse_query(query: Query) -> Result<Command> {
+    ensure!(query.with.is_none(), "WITH queries are not supported yet");
+    ensure!(query.offset.is_none(), "OFFSET is not supported yet");
+    ensure!(query.fetch.is_none(), "FETCH is not supported yet");
+    ensure!(query.limit_by.is_empty(), "LIMIT BY is not supported yet");
+    ensure!(
+        query.locks.is_empty(),
+        "locking clauses are not supported yet"
+    );
+    ensure!(
+        query.for_clause.is_none(),
+        "FOR clauses are not supported yet"
+    );
+    ensure!(
+        query.settings.is_none(),
+        "query SETTINGS are not supported yet"
+    );
+    ensure!(
+        query.format_clause.is_none(),
+        "query FORMAT clauses are not supported yet"
+    );
+
     let select = match *query.body {
         SetExpr::Select(select) => select,
         other => bail!("unsupported query body: {other}"),
@@ -324,16 +352,42 @@ fn parse_select(
     order_by: Option<sqlparser::ast::OrderBy>,
     limit: Option<Expr>,
 ) -> Result<SelectPlan> {
+    ensure!(
+        select.distinct.is_none(),
+        "SELECT DISTINCT is not supported yet"
+    );
+    ensure!(select.top.is_none(), "TOP is not supported yet");
+    ensure!(select.into.is_none(), "SELECT INTO is not supported yet");
+    ensure!(
+        select.lateral_views.is_empty(),
+        "LATERAL VIEW is not supported yet"
+    );
+    ensure!(select.prewhere.is_none(), "PREWHERE is not supported yet");
+    ensure!(select.having.is_none(), "HAVING is not supported yet");
+    ensure!(
+        select.named_window.is_empty(),
+        "WINDOW clauses are not supported yet"
+    );
+    ensure!(select.qualify.is_none(), "QUALIFY is not supported yet");
+    ensure!(
+        select.value_table_mode.is_none(),
+        "SELECT AS VALUE/STRUCT is not supported yet"
+    );
+    ensure!(
+        select.connect_by.is_none(),
+        "CONNECT BY is not supported yet"
+    );
     ensure!(select.from.len() == 1, "exactly one table is supported");
+    ensure!(
+        select.from[0].joins.is_empty(),
+        "JOIN clauses are not supported yet"
+    );
     let table_name = match &select.from[0].relation {
         TableFactor::Table { name, .. } => object_name_to_string(&name.0)?,
         other => bail!("unsupported table source: {other}"),
     };
 
-    let filters = match select.selection {
-        Some(expr) => parse_filters(expr)?,
-        None => Vec::new(),
-    };
+    let filter = select.selection.map(parse_filter_expr).transpose()?;
 
     let group_by = match select.group_by {
         sqlparser::ast::GroupByExpr::Expressions(exprs, _) => exprs
@@ -352,7 +406,7 @@ fn parse_select(
 
     Ok(SelectPlan {
         table_name,
-        filters,
+        filter,
         projections,
         group_by,
         order_by,
@@ -360,17 +414,25 @@ fn parse_select(
     })
 }
 
-fn parse_filters(expr: Expr) -> Result<Vec<Filter>> {
+fn parse_filter_expr(expr: Expr) -> Result<FilterExpr> {
     match expr {
+        Expr::Nested(expr) => parse_filter_expr(*expr),
         Expr::BinaryOp {
             left,
             op: BinaryOperator::And,
             right,
-        } => {
-            let mut filters = parse_filters(*left)?;
-            filters.extend(parse_filters(*right)?);
-            Ok(filters)
-        }
+        } => Ok(flatten_filter_expr(FilterExpr::And(vec![
+            parse_filter_expr(*left)?,
+            parse_filter_expr(*right)?,
+        ]))),
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Or,
+            right,
+        } => Ok(flatten_filter_expr(FilterExpr::Or(vec![
+            parse_filter_expr(*left)?,
+            parse_filter_expr(*right)?,
+        ]))),
         Expr::BinaryOp { left, op, right } => {
             let column = parse_identifier_expr(*left)?;
             let value = parse_sql_value_expr(*right)?;
@@ -383,29 +445,90 @@ fn parse_filters(expr: Expr) -> Result<Vec<Filter>> {
                 BinaryOperator::GtEq => CompareOp::Gte,
                 other => bail!("unsupported filter operator: {other}"),
             };
-            Ok(vec![Filter {
+            Ok(FilterExpr::Predicate(Filter {
                 column,
                 op,
                 value: Some(value),
-            }])
+            }))
         }
         Expr::IsNull(expr) => {
             let column = parse_identifier_expr(*expr)?;
-            Ok(vec![Filter {
+            Ok(FilterExpr::Predicate(Filter {
                 column,
                 op: CompareOp::IsNull,
                 value: None,
-            }])
+            }))
         }
         Expr::IsNotNull(expr) => {
             let column = parse_identifier_expr(*expr)?;
-            Ok(vec![Filter {
+            Ok(FilterExpr::Predicate(Filter {
                 column,
                 op: CompareOp::IsNotNull,
                 value: None,
-            }])
+            }))
         }
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => parse_in_list_filter(*expr, list, negated),
         other => bail!("unsupported WHERE expression: {other}"),
+    }
+}
+
+fn parse_in_list_filter(expr: Expr, list: Vec<Expr>, negated: bool) -> Result<FilterExpr> {
+    ensure!(!list.is_empty(), "IN lists must not be empty");
+    let column = parse_identifier_expr(expr)?;
+    let filters = list
+        .into_iter()
+        .map(|expr| {
+            let value = parse_sql_value_expr(expr)?;
+            ensure!(
+                value != Value::Null,
+                "NULL is not supported inside IN lists"
+            );
+            Ok(FilterExpr::Predicate(Filter {
+                column: column.clone(),
+                op: if negated {
+                    CompareOp::NotEq
+                } else {
+                    CompareOp::Eq
+                },
+                value: Some(value),
+            }))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(flatten_filter_expr(if negated {
+        FilterExpr::And(filters)
+    } else {
+        FilterExpr::Or(filters)
+    }))
+}
+
+fn flatten_filter_expr(expr: FilterExpr) -> FilterExpr {
+    match expr {
+        FilterExpr::And(children) => {
+            let mut flattened = Vec::new();
+            for child in children {
+                match flatten_filter_expr(child) {
+                    FilterExpr::And(grandchildren) => flattened.extend(grandchildren),
+                    other => flattened.push(other),
+                }
+            }
+            FilterExpr::And(flattened)
+        }
+        FilterExpr::Or(children) => {
+            let mut flattened = Vec::new();
+            for child in children {
+                match flatten_filter_expr(child) {
+                    FilterExpr::Or(grandchildren) => flattened.extend(grandchildren),
+                    other => flattened.push(other),
+                }
+            }
+            FilterExpr::Or(flattened)
+        }
+        other => other,
     }
 }
 
@@ -513,19 +636,26 @@ fn parse_function_column(arguments: FunctionArguments) -> Result<Option<String>>
     }
 }
 
-fn parse_order_by(order_by: Option<sqlparser::ast::OrderBy>) -> Result<Option<OrderByPlan>> {
+fn parse_order_by(order_by: Option<sqlparser::ast::OrderBy>) -> Result<Vec<OrderByTerm>> {
     let Some(order_by) = order_by else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
+    order_by
+        .exprs
+        .into_iter()
+        .map(parse_order_by_term)
+        .collect()
+}
+
+fn parse_order_by_term(expr: OrderByExpr) -> Result<OrderByTerm> {
     ensure!(
-        order_by.exprs.len() == 1,
-        "only one ORDER BY expression is supported"
+        expr.nulls_first.is_none(),
+        "ORDER BY NULLS FIRST/LAST is not supported yet"
     );
-    let OrderByExpr { expr, asc, .. } = order_by.exprs.into_iter().next().unwrap();
-    Ok(Some(OrderByPlan {
-        field: parse_identifier_expr(expr)?,
-        descending: matches!(asc, Some(false)),
-    }))
+    Ok(OrderByTerm {
+        field: parse_identifier_expr(expr.expr)?,
+        descending: matches!(expr.asc, Some(false)),
+    })
 }
 
 fn parse_identifier_expr(expr: Expr) -> Result<String> {

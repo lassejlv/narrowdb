@@ -130,6 +130,20 @@ When you INSERT rows, they first go into the **pending batch** — an in-memory 
 
 > **Important:** Before running a SELECT, the pending batch is automatically flushed so you can see your latest data.
 
+## Storage Invariants
+
+These rules matter when changing the engine or file format:
+
+- Every database file starts with a fixed 8-byte magic header: `NRWDB007`.
+- The on-disk layout is a sequence of typed records:
+  - `CREATE TABLE`
+  - `ROW_GROUP`
+- INSERT-style writes append new row-group records. They do not rewrite existing row groups.
+- Schema-changing operations such as `ALTER TABLE` and `DROP TABLE` first flush pending rows, then rebuild the full file from materialized tables.
+- File rewrites are written to a temporary file and then renamed into place, so schema changes do not destructively truncate the live database before the replacement snapshot is ready.
+- `query()` is intentionally read-only: it does not flush pending rows. `execute_sql()` does flush before `SELECT`.
+- Compatibility is currently tied to the magic/version header. If the header changes, old files must either be migrated explicitly or rejected clearly.
+
 ---
 
 ## Data Flow: Writing Data

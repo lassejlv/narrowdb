@@ -17,7 +17,7 @@ use rustc_hash::FxHashMap;
 
 use crate::sql::{
     AggregateKind, AlterTableOperationPlan, AlterTablePlan, ArithmeticOp, Command, EvalPlan,
-    OrderByPlan, ProjectionExpr, ScalarExpr, SelectPlan, parse_sql,
+    OrderByTerm, ProjectionExpr, ScalarExpr, SelectPlan, parse_sql,
 };
 use crate::storage::{
     DbOptions, PendingBatch, Storage, StoredRowGroup, Table, row_group_from_columnar_batch,
@@ -27,8 +27,8 @@ use ordered_float::OrderedFloat;
 
 use aggregate::AggState;
 use compile::{
-    CompiledProjection, CompiledProjectionExpr, CompiledScalarExpr, column_index, compile_filters,
-    compile_projections, required_column_indexes,
+    CompiledFilterExpr, CompiledProjection, CompiledProjectionExpr, CompiledScalarExpr,
+    column_index, compile_filter_expr, compile_projections, required_column_indexes,
 };
 use scan::{
     aggregate_row_group_all, aggregate_row_group_grouped, collect_row_group_aggregates,
@@ -180,6 +180,15 @@ impl NarrowDb {
 
     pub fn insert_rows(&self, table_name: &str, rows: Vec<Vec<Value>>) -> Result<()> {
         let mut inner = self.inner.write().map_err(|_| anyhow!("lock poisoned"))?;
+        inner.insert_rows_inner(table_name, rows)?;
+        Ok(())
+    }
+
+    pub fn insert_rows_iter<I>(&self, table_name: &str, rows: I) -> Result<usize>
+    where
+        I: IntoIterator<Item = Vec<Value>>,
+    {
+        let mut inner = self.inner.write().map_err(|_| anyhow!("lock poisoned"))?;
         inner.insert_rows_inner(table_name, rows)
     }
 
@@ -221,15 +230,15 @@ impl NarrowDb {
 
 impl Drop for NarrowDb {
     fn drop(&mut self) {
-        if let Ok(mut handle) = self.flush_handle.lock() {
-            if let Some(fh) = handle.take() {
-                fh.stop.store(true, AtomicOrdering::Relaxed);
-                if let Some(ref t) = fh.thread {
-                    t.thread().unpark();
-                }
-                if let Some(t) = fh.thread {
-                    let _ = t.join();
-                }
+        if let Ok(mut handle) = self.flush_handle.lock()
+            && let Some(fh) = handle.take()
+        {
+            fh.stop.store(true, AtomicOrdering::Relaxed);
+            if let Some(ref t) = fh.thread {
+                t.thread().unpark();
+            }
+            if let Some(t) = fh.thread {
+                let _ = t.join();
             }
         }
         if let Ok(mut inner) = self.inner.write() {
@@ -294,8 +303,12 @@ impl DbInner {
         Ok(())
     }
 
-    fn insert_rows_inner(&mut self, table_name: &str, rows: Vec<Vec<Value>>) -> Result<()> {
+    fn insert_rows_inner<I>(&mut self, table_name: &str, rows: I) -> Result<usize>
+    where
+        I: IntoIterator<Item = Vec<Value>>,
+    {
         let row_group_size = self.storage.options().row_group_size;
+        let mut inserted_rows = 0usize;
         let (schema, flushed_groups) = {
             let table = self
                 .tables
@@ -304,6 +317,7 @@ impl DbInner {
             let mut flushed_groups = Vec::new();
 
             for row in rows {
+                inserted_rows += 1;
                 ensure!(
                     row.len() == table.schema.columns.len(),
                     "row width mismatch"
@@ -340,7 +354,7 @@ impl DbInner {
             );
         }
 
-        Ok(())
+        Ok(inserted_rows)
     }
 
     fn insert_columnar_batch_inner(
@@ -672,7 +686,11 @@ impl DbInner {
             .iter()
             .map(|column| column.name.clone())
             .collect::<Vec<_>>();
-        let filters = compile_filters(&table.schema, &plan.filters)?;
+        let filter = plan
+            .filter
+            .as_ref()
+            .map(|filter| compile_filter_expr(&table.schema, filter))
+            .transpose()?;
         let required_columns = (0..table.schema.columns.len()).collect::<Vec<_>>();
         let mapped = self.storage.mapped_bytes();
         let col_count = table.schema.columns.len();
@@ -683,7 +701,7 @@ impl DbInner {
                 table,
                 query_threads,
                 mapped,
-                &filters,
+                filter.as_ref(),
                 &required_columns,
                 |row_group, row| {
                     (0..col_count)
@@ -693,19 +711,27 @@ impl DbInner {
             )
         })?;
 
-        apply_order_by_and_limit(&mut rows, &columns, plan.order_by.as_ref(), plan.limit)?;
+        apply_order_by_and_limit(&mut rows, &columns, &plan.order_by, plan.limit)?;
         Ok(QueryResult { columns, rows })
     }
 
     fn select_rows(&self, table: &Table, plan: &SelectPlan) -> Result<QueryResult> {
-        let filters = compile_filters(&table.schema, &plan.filters)?;
+        let filter = plan
+            .filter
+            .as_ref()
+            .map(|filter| compile_filter_expr(&table.schema, filter))
+            .transpose()?;
         let projections = compile_projections(&table.schema, &plan.group_by, &plan.projections)?;
         let columns = projections
             .iter()
             .map(|projection| projection.alias.clone())
             .collect::<Vec<_>>();
-        let required_columns =
-            required_column_indexes(table.schema.columns.len(), &filters, &projections, &[]);
+        let required_columns = required_column_indexes(
+            table.schema.columns.len(),
+            filter.as_ref(),
+            &projections,
+            &[],
+        );
         let mapped = self.storage.mapped_bytes();
         let query_threads = self.query_runtime.threads;
 
@@ -714,7 +740,7 @@ impl DbInner {
                 table,
                 query_threads,
                 mapped,
-                &filters,
+                filter.as_ref(),
                 &required_columns,
                 |row_group, row| {
                     projections
@@ -733,12 +759,16 @@ impl DbInner {
             )
         })?;
 
-        apply_order_by_and_limit(&mut rows, &columns, plan.order_by.as_ref(), plan.limit)?;
+        apply_order_by_and_limit(&mut rows, &columns, &plan.order_by, plan.limit)?;
         Ok(QueryResult { columns, rows })
     }
 
     fn select_aggregate(&self, table: &Table, plan: &SelectPlan) -> Result<QueryResult> {
-        let filters = compile_filters(&table.schema, &plan.filters)?;
+        let filter = plan
+            .filter
+            .as_ref()
+            .map(|filter| compile_filter_expr(&table.schema, filter))
+            .transpose()?;
         let projections = compile_projections(&table.schema, &plan.group_by, &plan.projections)?;
         let columns = projections
             .iter()
@@ -751,7 +781,7 @@ impl DbInner {
             .collect::<Result<Vec<_>>>()?;
         let required_columns = required_column_indexes(
             table.schema.columns.len(),
-            &filters,
+            filter.as_ref(),
             &projections,
             &group_indexes,
         );
@@ -765,7 +795,7 @@ impl DbInner {
             return self.select_fast_grouped_count(
                 table,
                 plan,
-                &filters,
+                filter.as_ref(),
                 &projections,
                 &columns,
                 &required_columns,
@@ -782,12 +812,12 @@ impl DbInner {
                     table,
                     query_threads,
                     mapped,
-                    &filters,
+                    filter.as_ref(),
                     &required_columns,
                     |row_group| {
                         aggregate_row_group_all(
                             row_group,
-                            &filters,
+                            filter.as_ref(),
                             &projections,
                             query_threads,
                             parallelize_rows,
@@ -819,12 +849,12 @@ impl DbInner {
                     table,
                     query_threads,
                     mapped,
-                    &filters,
+                    filter.as_ref(),
                     &required_columns,
                     |row_group| {
                         aggregate_row_group_grouped(
                             row_group,
-                            &filters,
+                            filter.as_ref(),
                             &projections,
                             &group_indexes,
                             query_threads,
@@ -852,7 +882,7 @@ impl DbInner {
                 .collect::<Result<Vec<_>>>()?
         };
 
-        apply_order_by_and_limit(&mut rows, &columns, plan.order_by.as_ref(), plan.limit)?;
+        apply_order_by_and_limit(&mut rows, &columns, &plan.order_by, plan.limit)?;
         Ok(QueryResult { columns, rows })
     }
 
@@ -861,7 +891,7 @@ impl DbInner {
         &self,
         table: &Table,
         plan: &SelectPlan,
-        filters: &[compile::CompiledFilter],
+        filter: Option<&CompiledFilterExpr>,
         projections: &[CompiledProjection],
         columns: &[String],
         required_columns: &[usize],
@@ -878,12 +908,12 @@ impl DbInner {
                             table,
                             query_threads,
                             mapped,
-                            filters,
+                            filter,
                             required_columns,
                             |row_group| {
                                 count_row_group_int64(
                                     row_group,
-                                    filters,
+                                    filter,
                                     fast_path.key_index,
                                     query_threads,
                                     parallelize_rows,
@@ -912,12 +942,12 @@ impl DbInner {
                             table,
                             query_threads,
                             mapped,
-                            filters,
+                            filter,
                             required_columns,
                             |row_group| {
                                 collect_row_group_int64_values(
                                     row_group,
-                                    filters,
+                                    filter,
                                     fast_path.key_index,
                                 )
                             },
@@ -945,9 +975,9 @@ impl DbInner {
                         table,
                         query_threads,
                         mapped,
-                        filters,
+                        filter,
                         required_columns,
-                        |row_group| count_row_group_bool(row_group, filters, fast_path.key_index),
+                        |row_group| count_row_group_bool(row_group, filter, fast_path.key_index),
                     )
                 })?;
 
@@ -967,7 +997,7 @@ impl DbInner {
         };
 
         if !(fast_path.order_by_count_desc && plan.limit.is_some()) {
-            apply_order_by_and_limit(&mut rows, columns, plan.order_by.as_ref(), plan.limit)?;
+            apply_order_by_and_limit(&mut rows, columns, &plan.order_by, plan.limit)?;
         }
 
         Ok(QueryResult {
@@ -1043,9 +1073,11 @@ fn classify_fast_grouped_count(
         return None;
     }
 
-    let order_by_count_desc = plan.order_by.as_ref().is_some_and(|order_by| {
-        order_by.descending && count_aliases.iter().any(|alias| alias == &order_by.field)
-    });
+    let order_by_count_desc = plan.order_by.len() == 1
+        && plan.order_by[0].descending
+        && count_aliases
+            .iter()
+            .any(|alias| alias == &plan.order_by[0].field);
 
     let mode = if matches!(key_type, FastGroupedCountKeyType::Int64)
         && order_by_count_desc
@@ -1242,34 +1274,39 @@ fn eval_compiled_scalar(
 fn apply_order_by_and_limit(
     rows: &mut Vec<Vec<Value>>,
     columns: &[String],
-    order_by: Option<&OrderByPlan>,
+    order_by: &[OrderByTerm],
     limit: Option<usize>,
 ) -> Result<()> {
-    if let Some(order_by) = order_by {
-        let order_index = columns
+    if !order_by.is_empty() {
+        let order_indexes = order_by
             .iter()
-            .position(|column| column == &order_by.field)
-            .with_context(|| {
-                format!("ORDER BY field {} not found in result set", order_by.field)
-            })?;
+            .map(|term| {
+                columns
+                    .iter()
+                    .position(|column| column == &term.field)
+                    .with_context(|| {
+                        format!("ORDER BY field {} not found in result set", term.field)
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
 
-        if let Some(limit) = limit {
-            if limit < rows.len() {
-                let pivot = limit;
-                rows.select_nth_unstable_by(pivot, |lhs, rhs| {
-                    compare_result_rows(lhs, rhs, order_index, order_by.descending)
-                });
-                rows.truncate(limit);
-            }
-        }
-
-        rows.sort_by(|lhs, rhs| compare_result_rows(lhs, rhs, order_index, order_by.descending));
-    }
-
-    if let Some(limit) = limit {
-        if rows.len() > limit {
+        if let Some(limit) = limit
+            && limit < rows.len()
+        {
+            let pivot = limit;
+            rows.select_nth_unstable_by(pivot, |lhs, rhs| {
+                compare_result_rows(lhs, rhs, &order_indexes, order_by)
+            });
             rows.truncate(limit);
         }
+
+        rows.sort_by(|lhs, rhs| compare_result_rows(lhs, rhs, &order_indexes, order_by));
+    }
+
+    if let Some(limit) = limit
+        && rows.len() > limit
+    {
+        rows.truncate(limit);
     }
     Ok(())
 }
@@ -1347,13 +1384,24 @@ fn eval_arithmetic(left: Value, op: ArithmeticOp, right: Value) -> Result<Value>
     }
 }
 
-fn compare_result_rows(lhs: &[Value], rhs: &[Value], index: usize, descending: bool) -> Ordering {
-    let ordering = lhs[index].compare(&rhs[index]).unwrap_or(Ordering::Equal);
-    if descending {
-        ordering.reverse()
-    } else {
-        ordering
+fn compare_result_rows(
+    lhs: &[Value],
+    rhs: &[Value],
+    indexes: &[usize],
+    terms: &[OrderByTerm],
+) -> Ordering {
+    for (index, term) in indexes.iter().zip(terms) {
+        let ordering = lhs[*index].compare(&rhs[*index]).unwrap_or(Ordering::Equal);
+        let ordering = if term.descending {
+            ordering.reverse()
+        } else {
+            ordering
+        };
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
     }
+    Ordering::Equal
 }
 
 fn data_type_to_sql_name(data_type: DataType) -> &'static str {
@@ -1368,17 +1416,22 @@ fn data_type_to_sql_name(data_type: DataType) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
     use crate::types::{BatchColumn, ColumnarBatch};
 
+    fn temp_db_path(label: &str) -> Result<PathBuf> {
+        Ok(std::env::temp_dir().join(format!(
+            "narrowdb-test-{label}-{}.db",
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        )))
+    }
+
     #[test]
     fn persists_and_queries() -> Result<()> {
-        let path = std::env::temp_dir().join(format!(
-            "narrowdb-test-{}.db",
-            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
-        ));
+        let path = temp_db_path("persist")?;
 
         {
             let db = NarrowDb::open(
@@ -2043,6 +2096,358 @@ mod tests {
                 vec![Value::Int64(100), Value::Int64(3)],
                 vec![Value::Int64(200), Value::Int64(2)],
             ]
+        );
+
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn query_hides_pending_rows_until_select_flushes() -> Result<()> {
+        let path = temp_db_path("pending-visibility")?;
+        let db = NarrowDb::open(
+            &path,
+            DbOptions {
+                row_group_size: 8,
+                ..DbOptions::default()
+            },
+        )?;
+        db.execute_sql("CREATE TABLE logs (ts TIMESTAMP, service TEXT);")?;
+        db.insert_row(
+            "logs",
+            vec![Value::Int64(1), Value::String("api".to_string())],
+        )?;
+
+        let hidden = db
+            .query("SELECT COUNT(*) AS total FROM logs;")?
+            .pop()
+            .unwrap();
+        assert_eq!(hidden.rows, vec![vec![Value::Int64(0)]]);
+
+        let visible = db.execute_one("SELECT COUNT(*) AS total FROM logs;")?;
+        assert_eq!(visible.rows, vec![vec![Value::Int64(1)]]);
+
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn rename_table_and_column_persist_across_reopen() -> Result<()> {
+        let path = temp_db_path("rename-reopen")?;
+
+        {
+            let db = NarrowDb::open(
+                &path,
+                DbOptions {
+                    row_group_size: 2,
+                    sync_on_flush: true,
+                    ..DbOptions::default()
+                },
+            )?;
+            db.execute_sql(
+                "CREATE TABLE logs (ts TIMESTAMP, service TEXT, status INT);
+                 INSERT INTO logs VALUES
+                    (1, 'api', 200),
+                    (2, 'worker', 500),
+                    (3, 'api', 503);",
+            )?;
+            db.execute_sql("ALTER TABLE logs RENAME TO app_logs;")?;
+            db.execute_sql("ALTER TABLE app_logs RENAME COLUMN service TO source;")?;
+        }
+
+        let db = NarrowDb::open(&path, DbOptions::default())?;
+        let describe = db.execute_one("DESCRIBE app_logs;")?;
+        assert_eq!(
+            describe.rows,
+            vec![
+                vec![
+                    Value::String("ts".to_string()),
+                    Value::String("TIMESTAMP".to_string()),
+                ],
+                vec![
+                    Value::String("source".to_string()),
+                    Value::String("TEXT".to_string()),
+                ],
+                vec![
+                    Value::String("status".to_string()),
+                    Value::String("INT".to_string()),
+                ],
+            ]
+        );
+
+        let result = db.execute_one(
+            "SELECT source, COUNT(*) AS total
+             FROM app_logs
+             GROUP BY source
+             ORDER BY source;",
+        )?;
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![Value::String("api".to_string()), Value::Int64(2)],
+                vec![Value::String("worker".to_string()), Value::Int64(1)],
+            ]
+        );
+
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn drop_table_rewrite_preserves_other_tables_across_reopen() -> Result<()> {
+        let path = temp_db_path("drop-rewrite")?;
+
+        {
+            let db = NarrowDb::open(
+                &path,
+                DbOptions {
+                    row_group_size: 8,
+                    sync_on_flush: true,
+                    ..DbOptions::default()
+                },
+            )?;
+            db.execute_sql(
+                "CREATE TABLE logs (id INT);
+                 CREATE TABLE metrics (name TEXT, value INT);",
+            )?;
+            db.execute_sql("INSERT INTO logs VALUES (1), (2);")?;
+            db.insert_row(
+                "metrics",
+                vec![Value::String("requests".to_string()), Value::Int64(42)],
+            )?;
+            db.execute_sql("DROP TABLE logs;")?;
+        }
+
+        let db = NarrowDb::open(&path, DbOptions::default())?;
+        let tables = db.execute_one("SHOW TABLES;")?;
+        assert_eq!(
+            tables.rows,
+            vec![vec![Value::String("metrics".to_string())]]
+        );
+
+        let metrics = db.execute_one("SELECT name, value FROM metrics;")?;
+        assert_eq!(
+            metrics.rows,
+            vec![vec![
+                Value::String("requests".to_string()),
+                Value::Int64(42)
+            ]]
+        );
+
+        let err = db.execute_one("SELECT * FROM logs;");
+        assert!(err.is_err());
+
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn persisted_null_filters_survive_reopen() -> Result<()> {
+        let path = temp_db_path("null-reopen")?;
+
+        {
+            let db = NarrowDb::open(
+                &path,
+                DbOptions {
+                    row_group_size: 2,
+                    sync_on_flush: true,
+                    ..DbOptions::default()
+                },
+            )?;
+            db.execute_sql(
+                "CREATE TABLE events (id INT, note TEXT);
+                 INSERT INTO events VALUES
+                    (1, NULL),
+                    (2, 'ok'),
+                    (3, NULL);",
+            )?;
+            db.flush_all()?;
+        }
+
+        let db = NarrowDb::open(&path, DbOptions::default())?;
+        let nulls = db.execute_one("SELECT id FROM events WHERE note IS NULL ORDER BY id;")?;
+        assert_eq!(
+            nulls.rows,
+            vec![vec![Value::Int64(1)], vec![Value::Int64(3)]]
+        );
+
+        let non_nulls =
+            db.execute_one("SELECT id FROM events WHERE note IS NOT NULL ORDER BY id;")?;
+        assert_eq!(non_nulls.rows, vec![vec![Value::Int64(2)]]);
+
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn supports_or_and_in_filters() -> Result<()> {
+        let path = temp_db_path("or-in-filters")?;
+        let db = NarrowDb::open(&path, DbOptions::default())?;
+        db.execute_sql(
+            "CREATE TABLE logs (id INT, service TEXT, status INT, level TEXT);
+             INSERT INTO logs VALUES
+                (1, 'api', 200, 'info'),
+                (2, 'worker', 500, 'error'),
+                (3, 'billing', 503, 'warn'),
+                (4, 'api', 404, 'error'),
+                (5, 'search', 200, 'info');",
+        )?;
+
+        let or_result = db.execute_one(
+            "SELECT id FROM logs
+             WHERE service = 'api' OR status >= 500
+             ORDER BY id;",
+        )?;
+        assert_eq!(
+            or_result.rows,
+            vec![
+                vec![Value::Int64(1)],
+                vec![Value::Int64(2)],
+                vec![Value::Int64(3)],
+                vec![Value::Int64(4)],
+            ]
+        );
+
+        let in_result = db.execute_one(
+            "SELECT id FROM logs
+             WHERE status IN (200, 404) AND level NOT IN ('warn')
+             ORDER BY id;",
+        )?;
+        assert_eq!(
+            in_result.rows,
+            vec![
+                vec![Value::Int64(1)],
+                vec![Value::Int64(4)],
+                vec![Value::Int64(5)],
+            ]
+        );
+
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn insert_rows_iter_streams_without_collecting_full_input() -> Result<()> {
+        let path = temp_db_path("insert-rows-iter")?;
+        let db = NarrowDb::open(
+            &path,
+            DbOptions {
+                row_group_size: 2,
+                ..DbOptions::default()
+            },
+        )?;
+        db.execute_sql("CREATE TABLE logs (ts TIMESTAMP, service TEXT, status INT);")?;
+
+        let inserted = db.insert_rows_iter(
+            "logs",
+            (0..5).map(|i| {
+                vec![
+                    Value::Int64(1_700_000_000_000 + i),
+                    Value::String(if i % 2 == 0 { "api" } else { "worker" }.to_string()),
+                    Value::Int64(if i % 2 == 0 { 200 } else { 500 }),
+                ]
+            }),
+        )?;
+
+        assert_eq!(inserted, 5);
+
+        let result = db.execute_one("SELECT COUNT(*) AS total FROM logs;")?;
+        assert_eq!(result.rows, vec![vec![Value::Int64(5)]]);
+
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn supports_multiple_order_by_terms() -> Result<()> {
+        let path = temp_db_path("multi-order-by")?;
+        let db = NarrowDb::open(&path, DbOptions::default())?;
+        db.execute_sql(
+            "CREATE TABLE logs (service TEXT, status INT, duration REAL);
+             INSERT INTO logs VALUES
+                ('api', 500, 5.0),
+                ('worker', 500, 9.0),
+                ('api', 200, 7.0),
+                ('billing', 500, 9.0),
+                ('billing', 200, 1.0);",
+        )?;
+
+        let result = db.execute_one(
+            "SELECT service, status, duration
+             FROM logs
+             ORDER BY status DESC, duration DESC, service ASC;",
+        )?;
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![
+                    Value::String("billing".to_string()),
+                    Value::Int64(500),
+                    Value::Float64(OrderedFloat(9.0)),
+                ],
+                vec![
+                    Value::String("worker".to_string()),
+                    Value::Int64(500),
+                    Value::Float64(OrderedFloat(9.0)),
+                ],
+                vec![
+                    Value::String("api".to_string()),
+                    Value::Int64(500),
+                    Value::Float64(OrderedFloat(5.0)),
+                ],
+                vec![
+                    Value::String("api".to_string()),
+                    Value::Int64(200),
+                    Value::Float64(OrderedFloat(7.0)),
+                ],
+                vec![
+                    Value::String("billing".to_string()),
+                    Value::Int64(200),
+                    Value::Float64(OrderedFloat(1.0)),
+                ],
+            ]
+        );
+
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn reports_clear_errors_for_unsupported_query_shapes() -> Result<()> {
+        let path = temp_db_path("unsupported-diagnostics")?;
+        let db = NarrowDb::open(&path, DbOptions::default())?;
+        db.execute_sql(
+            "CREATE TABLE logs (id INT, service TEXT);
+             CREATE TABLE metrics (id INT, value INT);",
+        )?;
+
+        let join_err = db
+            .execute_sql("SELECT * FROM logs JOIN metrics ON logs.id = metrics.id;")
+            .unwrap_err();
+        assert!(
+            join_err
+                .to_string()
+                .contains("JOIN clauses are not supported yet")
+        );
+
+        let distinct_err = db
+            .execute_sql("SELECT DISTINCT service FROM logs;")
+            .unwrap_err();
+        assert!(
+            distinct_err
+                .to_string()
+                .contains("SELECT DISTINCT is not supported yet")
+        );
+
+        let having_err = db
+            .execute_sql(
+                "SELECT service, COUNT(*) AS total FROM logs GROUP BY service HAVING total > 1;",
+            )
+            .unwrap_err();
+        assert!(
+            having_err
+                .to_string()
+                .contains("HAVING is not supported yet")
         );
 
         std::fs::remove_file(path)?;

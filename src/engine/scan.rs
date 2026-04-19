@@ -9,7 +9,7 @@ use crate::types::Value;
 
 use super::aggregate::AggState;
 use super::bitmap::SelectionBitmap;
-use super::compile::{CompiledFilter, CompiledProjection, LocalKeyPart};
+use super::compile::{CompiledFilter, CompiledFilterExpr, CompiledProjection, LocalKeyPart};
 
 // ---------------------------------------------------------------------------
 // Parallel scan — replaces the old sequential visitor-based scan_table
@@ -19,7 +19,7 @@ pub(super) fn parallel_scan_table<F>(
     table: &Table,
     query_threads: usize,
     mapped: Option<&[u8]>,
-    filters: &[CompiledFilter],
+    filter: Option<&CompiledFilterExpr>,
     required_columns: &[usize],
     extractor: F,
 ) -> Result<Vec<Vec<Value>>>
@@ -30,11 +30,11 @@ where
     let parallelize_rows = query_threads > 1 && table.row_groups.len() < query_threads;
 
     let process = |stored: &crate::storage::StoredRowGroup| -> Result<Vec<Vec<Value>>> {
-        if !row_group_matches(stored.rows(), stored.stats(), filters) {
+        if !row_group_matches(stored.rows(), stored.stats(), filter) {
             return Ok(Vec::new());
         }
         let loaded = stored.load(&table.schema, mapped, required_columns)?;
-        let selection = select_rows_bitmap(&loaded, filters);
+        let selection = select_rows_bitmap(&loaded, filter);
         if selection.is_empty() {
             return Ok(Vec::new());
         }
@@ -68,7 +68,7 @@ pub(super) fn collect_row_group_aggregates<T, F>(
     table: &Table,
     query_threads: usize,
     mapped: Option<&[u8]>,
-    filters: &[CompiledFilter],
+    filter: Option<&CompiledFilterExpr>,
     required_columns: &[usize],
     worker: F,
 ) -> Result<Vec<T>>
@@ -81,7 +81,7 @@ where
         table
             .row_groups
             .par_iter()
-            .filter(|rg| row_group_matches(rg.rows(), rg.stats(), filters))
+            .filter(|rg| row_group_matches(rg.rows(), rg.stats(), filter))
             .map(|rg| {
                 rg.load(&table.schema, mapped, required_columns)
                     .and_then(|l| worker(&l))
@@ -91,7 +91,7 @@ where
         table
             .row_groups
             .iter()
-            .filter(|rg| row_group_matches(rg.rows(), rg.stats(), filters))
+            .filter(|rg| row_group_matches(rg.rows(), rg.stats(), filter))
             .map(|rg| {
                 rg.load(&table.schema, mapped, required_columns)
                     .and_then(|l| worker(&l))
@@ -103,12 +103,12 @@ where
 
 pub(super) fn aggregate_row_group_all(
     row_group: &LoadedRowGroup<'_>,
-    filters: &[CompiledFilter],
+    filter: Option<&CompiledFilterExpr>,
     projections: &[CompiledProjection],
     query_threads: usize,
     parallelize_rows: bool,
 ) -> Result<Option<Vec<AggState>>> {
-    let selection = select_rows_bitmap(row_group, filters);
+    let selection = select_rows_bitmap(row_group, filter);
     if selection.is_empty() {
         return Ok(None);
     }
@@ -129,13 +129,13 @@ pub(super) fn aggregate_row_group_all(
 
 pub(super) fn aggregate_row_group_grouped(
     row_group: &LoadedRowGroup<'_>,
-    filters: &[CompiledFilter],
+    filter: Option<&CompiledFilterExpr>,
     projections: &[CompiledProjection],
     group_indexes: &[usize],
     query_threads: usize,
     parallelize_rows: bool,
 ) -> Result<FxHashMap<Vec<Value>, Vec<AggState>>> {
-    let selection = select_rows_bitmap(row_group, filters);
+    let selection = select_rows_bitmap(row_group, filter);
     if selection.is_empty() {
         return Ok(FxHashMap::default());
     }
@@ -151,16 +151,10 @@ pub(super) fn aggregate_row_group_grouped(
     }
 
     // Fast path: single StringDict GROUP BY column — use array-indexed aggregation.
-    if group_indexes.len() == 1 {
-        if let ColumnData::StringDict { dictionary, codes } = row_group.column(group_indexes[0]) {
-            return aggregate_single_stringdict(
-                row_group,
-                &selection,
-                projections,
-                dictionary,
-                codes,
-            );
-        }
+    if group_indexes.len() == 1
+        && let ColumnData::StringDict { dictionary, codes } = row_group.column(group_indexes[0])
+    {
+        return aggregate_single_stringdict(row_group, &selection, projections, dictionary, codes);
     }
 
     let mut local_groups: FxHashMap<SmallVec<[LocalKeyPart; 4]>, Vec<AggState>> =
@@ -188,12 +182,12 @@ pub(super) fn aggregate_row_group_grouped(
 
 pub(super) fn count_row_group_int64(
     row_group: &LoadedRowGroup<'_>,
-    filters: &[CompiledFilter],
+    filter: Option<&CompiledFilterExpr>,
     key_index: usize,
     query_threads: usize,
     parallelize_rows: bool,
 ) -> Result<FxHashMap<i64, i64>> {
-    let selection = select_rows_bitmap(row_group, filters);
+    let selection = select_rows_bitmap(row_group, filter);
     if selection.is_empty() {
         return Ok(FxHashMap::default());
     }
@@ -236,10 +230,10 @@ pub(super) fn count_row_group_int64(
 
 pub(super) fn count_row_group_bool(
     row_group: &LoadedRowGroup<'_>,
-    filters: &[CompiledFilter],
+    filter: Option<&CompiledFilterExpr>,
     key_index: usize,
 ) -> Result<[i64; 2]> {
-    let selection = select_rows_bitmap(row_group, filters);
+    let selection = select_rows_bitmap(row_group, filter);
     if selection.is_empty() {
         return Ok([0, 0]);
     }
@@ -257,10 +251,10 @@ pub(super) fn count_row_group_bool(
 
 pub(super) fn collect_row_group_int64_values(
     row_group: &LoadedRowGroup<'_>,
-    filters: &[CompiledFilter],
+    filter: Option<&CompiledFilterExpr>,
     key_index: usize,
 ) -> Result<Vec<i64>> {
-    let selection = select_rows_bitmap(row_group, filters);
+    let selection = select_rows_bitmap(row_group, filter);
     if selection.is_empty() {
         return Ok(Vec::new());
     }
@@ -477,17 +471,32 @@ fn aggregate_single_stringdict(
 // Row group stats pruning
 // ---------------------------------------------------------------------------
 
-fn row_group_matches(rows: usize, stats: &[ColumnStats], filters: &[CompiledFilter]) -> bool {
-    filters.iter().all(|filter| match filter.op {
-        CompareOp::Eq => stats_may_match_eq(&stats[filter.column_index], &filter.value),
-        CompareOp::Lt => stats_may_match_lt(&stats[filter.column_index], &filter.value),
-        CompareOp::Lte => stats_may_match_lte(&stats[filter.column_index], &filter.value),
-        CompareOp::Gt => stats_may_match_gt(&stats[filter.column_index], &filter.value),
-        CompareOp::Gte => stats_may_match_gte(&stats[filter.column_index], &filter.value),
-        CompareOp::NotEq => true,
-        CompareOp::IsNull => stats[filter.column_index].null_count > 0,
-        CompareOp::IsNotNull => stats[filter.column_index].null_count < rows,
-    })
+fn row_group_matches(
+    rows: usize,
+    stats: &[ColumnStats],
+    filter: Option<&CompiledFilterExpr>,
+) -> bool {
+    let Some(filter) = filter else {
+        return true;
+    };
+    match filter {
+        CompiledFilterExpr::Predicate(filter) => match filter.op {
+            CompareOp::Eq => stats_may_match_eq(&stats[filter.column_index], &filter.value),
+            CompareOp::Lt => stats_may_match_lt(&stats[filter.column_index], &filter.value),
+            CompareOp::Lte => stats_may_match_lte(&stats[filter.column_index], &filter.value),
+            CompareOp::Gt => stats_may_match_gt(&stats[filter.column_index], &filter.value),
+            CompareOp::Gte => stats_may_match_gte(&stats[filter.column_index], &filter.value),
+            CompareOp::NotEq => true,
+            CompareOp::IsNull => stats[filter.column_index].null_count > 0,
+            CompareOp::IsNotNull => stats[filter.column_index].null_count < rows,
+        },
+        CompiledFilterExpr::And(children) => children
+            .iter()
+            .all(|child| row_group_matches(rows, stats, Some(child))),
+        CompiledFilterExpr::Or(children) => children
+            .iter()
+            .any(|child| row_group_matches(rows, stats, Some(child))),
+    }
 }
 
 fn stats_may_match_eq(stats: &ColumnStats, value: &Value) -> bool {
@@ -545,23 +554,48 @@ fn stats_may_match_gte(stats: &ColumnStats, value: &Value) -> bool {
 
 fn select_rows_bitmap(
     row_group: &LoadedRowGroup<'_>,
-    filters: &[CompiledFilter],
+    filter: Option<&CompiledFilterExpr>,
 ) -> SelectionBitmap {
-    if !row_group_matches(row_group.rows, row_group.stats, filters) {
+    if !row_group_matches(row_group.rows, row_group.stats, filter) {
         return SelectionBitmap::none(row_group.rows);
     }
-    if filters.is_empty() {
-        return SelectionBitmap::all(row_group.rows);
-    }
+    eval_filter_bitmap(row_group, filter)
+}
 
-    let mut bitmap = SelectionBitmap::all(row_group.rows);
-    for filter in filters {
-        if bitmap.is_empty() {
-            break;
+fn eval_filter_bitmap(
+    row_group: &LoadedRowGroup<'_>,
+    filter: Option<&CompiledFilterExpr>,
+) -> SelectionBitmap {
+    let Some(filter) = filter else {
+        return SelectionBitmap::all(row_group.rows);
+    };
+
+    match filter {
+        CompiledFilterExpr::Predicate(filter) => {
+            let mut bitmap = SelectionBitmap::all(row_group.rows);
+            apply_filter_bitmap(row_group, filter, &mut bitmap);
+            bitmap
         }
-        apply_filter_bitmap(row_group, filter, &mut bitmap);
+        CompiledFilterExpr::And(children) => {
+            let mut bitmap = SelectionBitmap::all(row_group.rows);
+            for child in children {
+                if bitmap.is_empty() {
+                    break;
+                }
+                let child_bitmap = eval_filter_bitmap(row_group, Some(child));
+                bitmap.intersect(&child_bitmap);
+            }
+            bitmap
+        }
+        CompiledFilterExpr::Or(children) => {
+            let mut bitmap = SelectionBitmap::none(row_group.rows);
+            for child in children {
+                let child_bitmap = eval_filter_bitmap(row_group, Some(child));
+                bitmap.union(&child_bitmap);
+            }
+            bitmap
+        }
     }
-    bitmap
 }
 
 fn apply_filter_bitmap(
@@ -703,13 +737,12 @@ fn apply_string_dict(
             }
             None => bitmap.clear(),
         },
-        CompareOp::NotEq => match dictionary.iter().position(|s| s == target) {
-            Some(code) => {
+        CompareOp::NotEq => {
+            if let Some(code) = dictionary.iter().position(|s| s == target) {
                 let code = code as u32;
                 bitmap.retain_from_predicate_unchecked(|i| codes[i] != code);
             }
-            None => {}
-        },
+        }
         _ => {
             let pred: fn(&str, &str) -> bool = match op {
                 CompareOp::Lt => |a, b| a < b,

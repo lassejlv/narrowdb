@@ -1,7 +1,8 @@
 use std::cmp::Ordering;
-use std::fs::{File, OpenOptions};
+use std::fs::{File, OpenOptions, remove_file, rename};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail, ensure};
 use lz4_flex::block;
@@ -26,8 +27,6 @@ const STRING_ENCODING_DICT: u8 = 1;
 const CODE_ENCODING_U8: u8 = 0;
 const CODE_ENCODING_U16: u8 = 1;
 const CODE_ENCODING_U32: u8 = 2;
-
-use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct DbOptions {
@@ -771,6 +770,7 @@ impl Storage {
         let path = path.as_ref().to_path_buf();
         let mut file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&path)
@@ -848,24 +848,64 @@ impl Storage {
             materialized.push((table.schema.clone(), row_groups));
         }
 
-        self.mmap = None;
-        self.file.set_len(0)?;
-        self.file.seek(SeekFrom::Start(0))?;
-        self.file.write_all(MAGIC)?;
-        if self.options.sync_on_flush {
-            self.file.sync_data()?;
-        }
+        let temp_path = rewrite_temp_path(&self.path);
+        let result = (|| -> Result<()> {
+            let mut temp_file = OpenOptions::new()
+                .create_new(true)
+                .truncate(true)
+                .read(true)
+                .write(true)
+                .open(&temp_path)
+                .with_context(|| format!("opening rewrite temp file {}", temp_path.display()))?;
 
-        for (schema, row_groups) in &materialized {
-            self.append_create_table(schema)?;
-            for row_group in row_groups {
-                self.append_row_group(&schema.table_name, row_group, schema)?;
+            write_magic(&mut temp_file, self.options.sync_on_flush)?;
+
+            for (schema, row_groups) in &materialized {
+                append_create_table_to_file(&mut temp_file, schema, self.options.sync_on_flush)?;
+                for row_group in row_groups {
+                    append_row_group_to_file(
+                        &mut temp_file,
+                        &schema.table_name,
+                        row_group,
+                        schema,
+                        self.options.sync_on_flush,
+                    )?;
+                }
             }
+
+            if self.options.sync_on_flush {
+                temp_file.sync_all()?;
+            }
+            drop(temp_file);
+
+            self.mmap = None;
+            rename(&temp_path, &self.path).with_context(|| {
+                format!(
+                    "renaming rewrite temp file {} to {}",
+                    temp_path.display(),
+                    self.path.display()
+                )
+            })?;
+            if self.options.sync_on_flush {
+                sync_parent_dir(&self.path)?;
+            }
+
+            self.file = OpenOptions::new()
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&self.path)
+                .with_context(|| format!("reopening database file {}", self.path.display()))?;
+            self.remap()?;
+            self.file.seek(SeekFrom::End(0))?;
+            Ok(())
+        })();
+
+        if result.is_err() {
+            let _ = remove_file(&temp_path);
         }
 
-        self.remap()?;
-        self.file.seek(SeekFrom::End(0))?;
-        Ok(())
+        result
     }
 
     pub fn append_create_table(&mut self, schema: &Schema) -> Result<()> {
@@ -884,16 +924,7 @@ impl Storage {
     }
 
     fn append_record(&mut self, kind: u8, payload: &[u8]) -> Result<()> {
-        let mut writer = BufWriter::new(&self.file);
-        writer.write_all(&[kind])?;
-        writer.write_all(&(payload.len() as u64).to_le_bytes())?;
-        writer.write_all(payload)?;
-        writer.flush()?;
-        drop(writer);
-        if self.options.sync_on_flush {
-            self.file.sync_data()?;
-        }
-        Ok(())
+        append_record_to_file(&mut self.file, kind, payload, self.options.sync_on_flush)
     }
 
     fn load_tables(path: &Path, options: &DbOptions) -> Result<FxHashMap<String, Table>> {
@@ -957,6 +988,85 @@ impl Storage {
     pub fn path(&self) -> &Path {
         &self.path
     }
+}
+
+fn rewrite_temp_path(path: &Path) -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("narrowdb.db");
+    path.with_file_name(format!(
+        "{file_name}.rewrite-{}-{nonce}.tmp",
+        std::process::id()
+    ))
+}
+
+fn write_magic(file: &mut File, sync_on_flush: bool) -> Result<()> {
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(MAGIC)?;
+    if sync_on_flush {
+        file.sync_data()?;
+    }
+    Ok(())
+}
+
+fn append_create_table_to_file(
+    file: &mut File,
+    schema: &Schema,
+    sync_on_flush: bool,
+) -> Result<()> {
+    let payload = encode_schema(schema)?;
+    append_record_to_file(file, RECORD_CREATE_TABLE, &payload, sync_on_flush)
+}
+
+fn append_row_group_to_file(
+    file: &mut File,
+    table_name: &str,
+    row_group: &RowGroup,
+    schema: &Schema,
+    sync_on_flush: bool,
+) -> Result<()> {
+    let payload = encode_row_group(table_name, row_group, schema)?;
+    append_record_to_file(file, RECORD_ROW_GROUP, &payload, sync_on_flush)
+}
+
+fn append_record_to_file(
+    file: &mut File,
+    kind: u8,
+    payload: &[u8],
+    sync_on_flush: bool,
+) -> Result<()> {
+    let mut writer = BufWriter::new(&mut *file);
+    writer.write_all(&[kind])?;
+    writer.write_all(&(payload.len() as u64).to_le_bytes())?;
+    writer.write_all(payload)?;
+    writer.flush()?;
+    drop(writer);
+    if sync_on_flush {
+        file.sync_data()?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .with_context(|| format!("database path {} has no parent directory", path.display()))?;
+    File::open(parent)
+        .with_context(|| format!("opening parent directory {}", parent.display()))?
+        .sync_all()
+        .with_context(|| format!("syncing parent directory {}", parent.display()))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 fn encode_schema(schema: &Schema) -> Result<Vec<u8>> {
@@ -1508,4 +1618,93 @@ fn read_f64(payload: &[u8], cursor: &mut usize) -> Result<f64> {
     buf.copy_from_slice(&payload[*cursor..*cursor + 8]);
     *cursor += 8;
     Ok(f64::from_le_bytes(buf))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_path(label: &str) -> Result<PathBuf> {
+        Ok(std::env::temp_dir().join(format!(
+            "narrowdb-storage-{label}-{}.db",
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        )))
+    }
+
+    #[test]
+    fn open_new_storage_writes_magic_header() -> Result<()> {
+        let path = temp_path("magic")?;
+        let _ = Storage::open(&path, DbOptions::default())?;
+
+        let bytes = std::fs::read(&path)?;
+        assert_eq!(&bytes[..MAGIC.len()], MAGIC);
+
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn open_rejects_invalid_header() -> Result<()> {
+        let path = temp_path("invalid-header")?;
+        std::fs::write(&path, b"not-a-db")?;
+
+        let err = Storage::open(&path, DbOptions::default())
+            .err()
+            .expect("invalid header should be rejected");
+        assert!(
+            err.to_string()
+                .contains("invalid database header or unsupported format version")
+        );
+
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn open_rejects_unknown_record_kind() -> Result<()> {
+        let path = temp_path("unknown-record")?;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        bytes.push(99);
+        bytes.extend_from_slice(&0_u64.to_le_bytes());
+        std::fs::write(&path, bytes)?;
+
+        let err = Storage::open(&path, DbOptions::default())
+            .err()
+            .expect("unknown record kind should be rejected");
+        assert!(err.to_string().contains("unknown record kind: 99"));
+
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn rewrite_with_tables_rejects_pending_rows() -> Result<()> {
+        let path = temp_path("pending-rewrite")?;
+        let (mut storage, _) = Storage::open(&path, DbOptions::default())?;
+        let schema = Schema {
+            table_name: "logs".to_string(),
+            columns: vec![ColumnDef {
+                name: "ts".to_string(),
+                data_type: DataType::Timestamp,
+            }],
+        };
+
+        storage.append_create_table(&schema)?;
+
+        let mut table = Table::new(schema.clone(), storage.options());
+        table.pending.append_row(vec![Value::Int64(1)])?;
+
+        let mut tables = FxHashMap::default();
+        tables.insert(schema.table_name.clone(), table);
+
+        let err = storage.rewrite_with_tables(&mut tables).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot rewrite with pending rows in table logs")
+        );
+
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
 }

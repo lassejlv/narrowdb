@@ -1,6 +1,6 @@
 {
   "name": "@narrowdb/node",
-  "version": "0.3.2",
+  "version": "0.3.1",
   "description": "Node.js bindings for the NarrowDB columnar database engine",
   "main": "index.js",
   "types": "index.d.ts",
