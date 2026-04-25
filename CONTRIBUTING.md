@@ -67,23 +67,23 @@ Run the comparison benchmark against DuckDB:
 cargo run --release --features bench-duckdb --bin bench-compare -- 1000000 --query-threads 8
 ```
 
-Benchmark definitions live in [bench/common.rs](./bench/common.rs).
+Benchmark definitions live in [tools/bench/common.rs](./tools/bench/common.rs).
 
 ## Docs To Keep In Sync
 
 If you change flags, versions, or supported behavior, update these files in the same patch:
 
 - [README.md](./README.md)
-- [docs.md](./docs.md)
+- [docs/USER_GUIDE.md](./docs/USER_GUIDE.md)
 - [crates/server/README.md](./crates/server/README.md)
-- [ROADMAP.md](./ROADMAP.md), if priorities shift
+- [docs/ROADMAP.md](./docs/ROADMAP.md), if priorities shift
 
 ## Release Hygiene
 
 Before cutting a release:
 
 ```bash
-./scripts/check-release.sh
+./tools/release/check-release.sh
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
@@ -96,4 +96,4 @@ Also verify version alignment across:
 - [crates/narrow-napi/Cargo.toml](./crates/narrow-napi/Cargo.toml)
 - [crates/narrow-napi/package.json](./crates/narrow-napi/package.json)
 
-Release steps and artifact expectations live in [RELEASE.md](./RELEASE.md).
+Release steps and artifact expectations live in [docs/RELEASE.md](./docs/RELEASE.md).

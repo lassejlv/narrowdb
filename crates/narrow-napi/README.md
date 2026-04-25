@@ -16,4 +16,4 @@ npm install @narrowdb/node
 
 - The package ships prebuilt platform artifacts through the npm release workflow.
 - The source of truth for engine behavior remains the Rust crate in the repository root.
-- If you change public behavior or package metadata, keep [CHANGELOG.md](../../CHANGELOG.md) and the release workflow in sync.
+- If you change public behavior or package metadata, keep [docs/CHANGELOG.md](../../docs/CHANGELOG.md) and the release workflow in sync.

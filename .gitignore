@@ -1,1 +1,4 @@
 /target
+/tools/bench/results/
+*.db
+*.narrowdb

@@ -98,6 +98,7 @@ cargo run --release --features bench-duckdb --bin bench-compare -- 1000000 --que
 
 ## Development
 
+For full docs, see [docs/README.md](./docs/README.md).
 For build, test, lint, benchmark, and release commands, see [CONTRIBUTING.md](./CONTRIBUTING.md).
 
 ## License

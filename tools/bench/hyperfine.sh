@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RESULTS_DIR="$ROOT_DIR/bench/results"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+RESULTS_DIR="$ROOT_DIR/tools/bench/results"
 
 rows=1000000
 query_threads="${QUERY_THREADS:-}"
@@ -13,7 +13,7 @@ json_out=""
 
 usage() {
   cat <<'EOF'
-Usage: bench/hyperfine.sh [options]
+Usage: tools/bench/hyperfine.sh [options]
 
 Options:
   --rows <n>             Row count to generate per benchmark run. Default: 1000000
@@ -21,13 +21,13 @@ Options:
                          Default: use all available cores.
   --warmup <n>           Hyperfine warmup runs. Default: 3
   --min-runs <n>         Minimum Hyperfine timing runs. Default: 10
-  --export-markdown <p>  Markdown export path. Default: bench/results/hyperfine.md
-  --export-json <p>      JSON export path. Default: bench/results/hyperfine.json
+  --export-markdown <p>  Markdown export path. Default: tools/bench/results/hyperfine.md
+  --export-json <p>      JSON export path. Default: tools/bench/results/hyperfine.json
   -h, --help             Show this help text
 
 Examples:
-  bench/hyperfine.sh --rows 1000000 --query-threads 8
-  bench/hyperfine.sh --rows 100000 --warmup 1 --min-runs 5
+  tools/bench/hyperfine.sh --rows 1000000 --query-threads 8
+  tools/bench/hyperfine.sh --rows 100000 --warmup 1 --min-runs 5
 EOF
 }
 

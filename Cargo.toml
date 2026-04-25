@@ -14,16 +14,16 @@ path = "src/main.rs"
 
 [[bin]]
 name = "bench-narrow"
-path = "bench/narrow.rs"
+path = "tools/bench/narrow.rs"
 
 [[bin]]
 name = "bench-duckdb"
-path = "bench/duckdb.rs"
+path = "tools/bench/duckdb.rs"
 required-features = ["bench-duckdb"]
 
 [[bin]]
 name = "bench-compare"
-path = "bench/compare.rs"
+path = "tools/bench/compare.rs"
 required-features = ["bench-duckdb"]
 
 [features]

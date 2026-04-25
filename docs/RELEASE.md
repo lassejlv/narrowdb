@@ -9,15 +9,15 @@ This repository ships three public distribution surfaces:
 ## Before tagging
 
 1. Update versions together:
-   - [Cargo.toml](./Cargo.toml)
-   - [crates/server/Cargo.toml](./crates/server/Cargo.toml)
-   - [crates/narrow-napi/Cargo.toml](./crates/narrow-napi/Cargo.toml)
-   - [crates/narrow-napi/package.json](./crates/narrow-napi/package.json)
+   - [Cargo.toml](../Cargo.toml)
+   - [crates/server/Cargo.toml](../crates/server/Cargo.toml)
+   - [crates/narrow-napi/Cargo.toml](../crates/narrow-napi/Cargo.toml)
+   - [crates/narrow-napi/package.json](../crates/narrow-napi/package.json)
 2. Add a matching changelog section in [CHANGELOG.md](./CHANGELOG.md).
 3. Run:
 
 ```bash
-./scripts/check-release.sh
+./tools/release/check-release.sh
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
